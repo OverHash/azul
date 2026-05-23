@@ -4,9 +4,9 @@
 
 | Status | #   | Branch Name                          | Remote | Commit Hash | Description                      |
 | ------ | --- | ------------------------------------ | ------ | ----------- | -------------------------------- |
-| ☐      | 1   | feat/folder-backed-scripts           | origin | TBD         | Ransomwave/azul PR #39           |
+| ☑      | 1   | feat/folder-backed-scripts           | origin | c2405452a766df398b034757189725b40ea1b6fa | Ransomwave/azul PR #39           |
 | ☐      | 2   | fix/delete-orphans-script-files-only | origin | TBD         | Preserve non-script orphan files |
 
 ## Merge Log
 
-- No branches merged yet.
+- `feat/folder-backed-scripts` at `c2405452a766df398b034757189725b40ea1b6fa`: already present in the local `main` baseline; no conflicts.
