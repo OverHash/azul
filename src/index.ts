@@ -9,6 +9,7 @@ import { FileWatcher } from "./fs/watcher.js";
 import { SourcemapGenerator } from "./sourcemap/generator.js";
 import { log } from "./util/log.js";
 import { config, initializeConfig } from "./config.js";
+import { isScriptFileName } from "./util/scriptFile.js";
 import type { StudioMessage } from "./ipc/messages.js";
 
 /**
@@ -401,7 +402,7 @@ export class SyncDaemon {
   }
 
   /**
-   * Delete files under syncDir that are not mapped to any instance (opt-in).
+   * Delete script files under syncDir that are not mapped to any instance (opt-in).
    */
   private cleanupOrphanFiles(): void {
     if (!config.deleteOrphansOnConnect) {
@@ -424,7 +425,7 @@ export class SyncDaemon {
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) {
           walk(fullPath);
-        } else {
+        } else if (isScriptFileName(entry.name)) {
           if (!mapped.has(path.resolve(fullPath))) {
             try {
               fs.unlinkSync(fullPath);
