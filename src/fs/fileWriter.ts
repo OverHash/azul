@@ -287,8 +287,26 @@ export class FileWriter {
     return (
       config.folderBackedScriptsWithChildren &&
       this.isScriptNode(node) &&
-      node.children.size > 0
+      this.hasDescendantScript(node)
     );
+  }
+
+  private hasDescendantScript(node: TreeNode): boolean {
+    const stack = [...node.children.values()];
+
+    while (stack.length > 0) {
+      const child = stack.pop()!;
+
+      if (this.isScriptNode(child)) {
+        return true;
+      }
+
+      for (const grandchild of child.children.values()) {
+        stack.push(grandchild);
+      }
+    }
+
+    return false;
   }
 
   /**
