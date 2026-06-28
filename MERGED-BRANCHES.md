@@ -11,3 +11,9 @@
 
 - Merged `feat/folder-backed-scripts` at `138c47e16454060ba26f26feecbacbd1b5039ac6` with no conflicts. Build passed. Verified folder-backed script export support in `src/config.ts`, `src/fs/fileWriter.ts`, and `src/index.ts`.
 - Merged `fix/delete-orphans-script-files-only` at `a743abfeb497eac4672ec95c308d9ca4929e626a` with no conflicts. Build passed. Verified orphan cleanup only removes script files via `isScriptFileName` in `src/index.ts`.
+
+## Comparison to Previous Integration Branch
+
+Previous integration branch: None found locally
+
+No comparison was possible because there is no earlier local integration branch.
