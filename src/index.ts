@@ -1360,7 +1360,7 @@ export class SyncDaemon {
   }
 
   /**
-   * Delete files under syncDir that are not mapped to any instance (opt-in).
+   * Delete script files under syncDir that are not mapped to any instance (opt-in).
    */
   private cleanupOrphanFiles(): void {
     const deleteOrphans =
@@ -1385,7 +1385,7 @@ export class SyncDaemon {
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) {
           walk(fullPath);
-        } else {
+        } else if (isScriptFileName(entry.name)) {
           if (!mapped.has(path.resolve(fullPath))) {
             try {
               fs.unlinkSync(fullPath);

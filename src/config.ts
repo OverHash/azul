@@ -30,7 +30,7 @@ export interface AzulConfig {
   /** Debounce delay for file watching (ms) */
   fileWatchDebounce: number;
 
-  /** Delete unmapped files in syncDir after a new connection/full snapshot */
+  /** Delete unmapped script files in syncDir after a new connection/full snapshot */
   deleteOrphansOnConnect: boolean;
 
   /** Suffix ModuleScript names with ".module"? */

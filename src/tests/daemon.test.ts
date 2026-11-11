@@ -297,6 +297,35 @@ async function readSettledSourcemap(): Promise<any> {
   return readSourcemap();
 }
 
+test("orphan cleanup preserves non-script files and honors per-place overrides with init layouts", async () => {
+  await withFolderBackedDaemon(async (daemon, tmp) => {
+    folderBackedSnapshot(daemon);
+    const dir = path.join(tmp, "ReplicatedStorage", "Parent");
+    for (const file of ["AGENTS.md", "asset.json", "notes.txt", "image.png"]) {
+      fs.writeFileSync(path.join(dir, file), "keep me");
+    }
+    for (const file of ["orphan.lua", "orphan.luau", "orphan.server.luau"]) {
+      fs.writeFileSync(path.join(dir, file), "remove me");
+    }
+    config.deleteOrphansOnConnect = false;
+    daemon.applyPlaceConfig({ deleteOrphansOnConnect: true });
+    daemon.cleanupOrphanFiles();
+    for (const file of ["AGENTS.md", "asset.json", "notes.txt", "image.png"]) {
+      assert.equal(fs.readFileSync(path.join(dir, file), "utf8"), "keep me");
+    }
+    for (const file of ["orphan.lua", "orphan.luau", "orphan.server.luau"]) {
+      assert.equal(fs.existsSync(path.join(dir, file)), false);
+    }
+    assert.equal(fs.readFileSync(path.join(dir, "init.luau"), "utf8"), "return {}");
+    assert.equal(fs.readFileSync(path.join(dir, "Child.luau"), "utf8"), "return 1");
+    config.deleteOrphansOnConnect = true;
+    daemon.applyPlaceConfig({ deleteOrphansOnConnect: false });
+    fs.writeFileSync(path.join(dir, "orphan.luau"), "keep this too");
+    daemon.cleanupOrphanFiles();
+    assert.ok(fs.existsSync(path.join(dir, "orphan.luau")));
+  });
+});
+
 test("fullSnapshot writes scripts, generates sourcemap, and removes orphans", async () => {
   const tmp = makeTempDir();
   const prevSyncDir = config.syncDir;
@@ -316,6 +345,8 @@ test("fullSnapshot writes scripts, generates sourcemap, and removes orphans", as
     fs.mkdirSync(orphanDir, { recursive: true });
     const orphanPath = path.join(orphanDir, "orphan.luau");
     fs.writeFileSync(orphanPath, "print('i am orphan')", "utf8");
+    const notesPath = path.join(orphanDir, "AGENTS.md");
+    fs.writeFileSync(notesPath, "preserve instructions", "utf8");
     assert.ok(fs.existsSync(orphanPath), "orphan created");
 
     daemon = new SyncDaemon();
@@ -362,6 +393,7 @@ test("fullSnapshot writes scripts, generates sourcemap, and removes orphans", as
 
     // Orphan file should have been removed
     assert.strictEqual(fs.existsSync(orphanPath), false, "orphan file removed");
+    assert.equal(fs.readFileSync(notesPath, "utf8"), "preserve instructions");
   } finally {
     await daemon?.stop();
     config.syncDir = prevSyncDir;
