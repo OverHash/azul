@@ -8,33 +8,52 @@
 
 > If the plugin does not show up, follow the [troubleshooting steps](#troubleshooting).
 
-### Method 2: Manual Install via Place File
-
-1. Download the source code from the [Azul Companion Plugin](https://www.roblox.com/games/132762411481199/Azul-Companion-Plugin) place: (3 dots (⋯) > "Download")
-2. Open the downloaded `.rbxlx` or `.rbxl` file in Roblox Studio
-3. Right-click the `AzulCompanionPlugin` folder in `ReplicatedFirst` and select **"Save as Local Plugin"**
-4. Restart Roblox Studio
-5. The Azul icon should now appear in the toolbar
-
-### Method 3: Build via Azul
+### Method 2: Build via Azul (for contributors)
 
 You can use Azul to build the plugin directly from source code:
 
-```ps1
-cd plugin
-azul build --from-sourcemap .\sourcemap.json
+```sh
+# Mount the plugin source to your local Roblox Studio
+azul push -s ./plugin -d ReplicatedFirst.AzulCompanionPlugin
 ```
 
-> [!NOTE]
-> Note that, for now, you must first have **the plugin itself already installed** in Studio for this option to work.
+> [!IMPORTANT]
+> You must have **the plugin already installed in Studio** for this option to work.
 >
-> This is planned to change soon by allowing Azul to generate Model files (`rbxmx`) directly.
+> This will change in the future, once Azul is able to generate Model files (`rbxm`) directly.
+
+#### Plugin Dependencies
+
+**Dependencies already come bundled with the Plugin** (`sync/ReplicatedFirst/AzulCompanionPlugin/Packages`). If you wish to modify them, you'll need to manually install the dependencies in your local plugin folder and push the changes back:
+
+```sh
+# Switch to the plugin directory
+cd plugin
+
+# Install dependencies
+rokit install
+lpm install
+
+# After modifying dependencies, push the changes to the plugin
+azul push -s ./Packages/roblox -d ReplicatedFirst.AzulCompanionPlugin.Packages --rojo --destructive
+
+# If you have modified the properties, added, renamed, moved or deleted any scripts, you will need to pack them into a new sourcemap
+azul pack -o ./plugin.sourcemap.json
+```
+
+The `rbx_dom_lua` dependency is not managed by any package manager. To manage it, use the handy Node script `vendor:rbx-dom-lua`:
+
+```ps1
+# Gets commit ref pinned in `scripts/vendor-rbx-dom-lua.mjs` (hopefully the latest rbx-dom)
+# and pushes it to the plugin
+npm run vendor:rbx-dom-lua
+```
 
 ## Troubleshooting
 
 ### Plugin not showing up
 
-Roblox is very particular about how plugins are installed. Sometimes, just "getting" the plugin from the marketplace isn't enough. Try the following steps:
+Roblox is very particular about how plugins are installed. "Getting" the plugin from the marketplace isn't enough, you must install it from your **Inventory**:
 
 1. Restart Roblox Studio
 2. Open any game (or create a new one)
@@ -47,13 +66,10 @@ Roblox is very particular about how plugins are installed. Sometimes, just "gett
 ### Plugin not connecting
 
 - Ensure the daemon is running (run `azul`)
-- Check that `HttpService` is enabled:
-  - Go to **Home** → **Game Settings** → **Security**
-  - Enable **"Allow HTTP Requests"**
-- Verify firewall isn't blocking port 8080
+- Verify firewall isn't blocking port `8080`
 
 ### Scripts not syncing
 
-- Click "Toggle Sync" to reconnect
-- Check the Output window for error messages
-- Restart both the daemon and Studio
+- In the Plugin, scroll down and click on "Reload Sourcemap"
+- Try reconnecting both the plugin and the daemon
+- Check for any errors in the daemon console and plugin output window

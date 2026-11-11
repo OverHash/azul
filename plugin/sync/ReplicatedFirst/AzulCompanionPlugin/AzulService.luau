@@ -1,25 +1,22 @@
 --!strict
 local AzulService = {}
-AzulService.VERSION = 42
+AzulService.VERSION = "2.5.0"
 
 -- Services
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local HttpService = game:GetService("HttpService")
+local InsertService = game:GetService("InsertService")
 
 -- Modules
 local Serializer = require("./Serializer")
 local Config = require("./Config")
 local Enums = require("./Enums")
+local PlaceConfig = require("./PlaceConfig")
 
 -- Logging helpers
 local function debugPrint(...)
 	if Config.SILENT_MODE or not Config.DEBUG_MODE then return end
 	print(`[🐛 AzulService]:`, ...)
-end
-
-local function infoPrint(...)
-	if Config.SILENT_MODE then return end
-	print(`[AzulService]:`, ...)
 end
 
 --[=[
@@ -31,13 +28,17 @@ function AzulService.isScript(instance)
 	return instance:IsA("Script") or instance:IsA("LocalScript") or instance:IsA("ModuleScript")
 end
 
+function AzulService.isScriptClass(className)
+	return className == "Script" or className == "LocalScript" or className == "ModuleScript"
+end
+
 --[=[
 	Utility: Rebuild service set from config
 	@param serviceSet { [string]: boolean } - The service set to rebuild
 ]=]
 function AzulService.rebuildServiceSet(serviceSet)
 	table.clear(serviceSet)
-	for _, name in ipairs(Config.SERVICE_LIST) do
+	for _, name in Config.SERVICE_LIST do
 		serviceSet[name] = true
 	end
 end
@@ -54,7 +55,16 @@ function AzulService.isExcluded(instance: Instance, serviceSet: { [string]: bool
 	-- Walk up to the service
 	local current: Instance? = instance
 	while current do
+		-- Is it an ignored ClassName?
+		for _, className in Config.IGNORED_CLASSES do
+			if current.ClassName == className then return true end
+		end
+
 		if current.Parent == game then
+			-- Players' descendants are runtime Player objects that can't be rebuilt (WritePlayer), so only the service itself is kept
+			if current ~= instance and current.ClassName == "Players" then return true end
+
+			-- Handle whitelist/blacklist logic based on the service set
 			local inList = serviceSet[current.Name] ~= nil
 
 			if Config.LIST_TYPE == Enums.listType.WHITELIST then
@@ -77,14 +87,12 @@ end
 --- Utility: Get or create instance by path segments
 function AzulService.getOrCreatePath(pathSegments: { string }): Instance
 	local current: Instance = game
-	for index, segment in ipairs(pathSegments) do
+	for index, segment in pathSegments do
 		local nextNode: Instance? = current:FindFirstChild(segment)
 
 		if not nextNode then
 			if index == 1 then
-				local ok, service = pcall(function()
-					return game:GetService(segment)
-				end)
+				local ok, service = pcall(function() return game:GetService(segment) end)
 				if ok and service then nextNode = service end
 			end
 
@@ -105,10 +113,13 @@ end
 function AzulService.isProtectedRobloxContainer(instance: Instance?): boolean
 	if not instance then return false end
 
+	-- Can't destroy terrain!
+	-- In the future, we may want to serialize terrain chunks and wipe them here
+	-- For now, just skip terrain entirely
+	if instance:IsA("Terrain") then return true end
+
 	-- Top-level services cannot be destroyed or reparented
-	local okService = pcall(function()
-		return game:GetService(instance.Name)
-	end)
+	local okService = pcall(function() return game:GetService(instance.Name) end)
 	if instance.Parent == game and okService then return true end
 
 	-- Certain StarterPlayer children are locked (StarterPlayerScripts, StarterCharacterScripts, StarterGear)
@@ -186,7 +197,7 @@ function AzulService.instanceToData(
 		parentGuid = parentGuid,
 	}
 
-	if AzulService.isScript(instance) then data.source = (instance :: Script).Source end
+	if AzulService.isScript(instance) then data.source = ScriptEditorService:GetEditorSource(instance) end
 
 	if options and options.includeProperties then
 		local properties = Serializer.collectSerializedProperties(instance, {
@@ -204,7 +215,7 @@ function AzulService.instanceToData(
 		})
 		if next(properties) ~= nil then data.properties = properties end
 
-		local attributes = instance:GetAttributes()
+		local attributes = Serializer.collectSerializedAttributes(instance)
 		if next(attributes) ~= nil then data.attributes = attributes end
 
 		local tags = Serializer.collectSerializedTags(instance)
@@ -217,9 +228,7 @@ end
 --- Utility: set script source safely (handles large sources via ScriptEditorService)
 function AzulService.setScriptSource(scriptInstance: Script | LocalScript | ModuleScript, source: string)
 	local okUpdateSource, errUpdateSource = pcall(function()
-		ScriptEditorService:UpdateSourceAsync(scriptInstance, function(...)
-			return source
-		end)
+		ScriptEditorService:UpdateSourceAsync(scriptInstance, function(...) return source end)
 	end)
 
 	if not okUpdateSource then
@@ -272,18 +281,108 @@ type InstanceData = {
 	tags: { string }?,
 }
 
+type MeshData = {
+	meshId: string,
+	collisionFidelity: Enum.CollisionFidelity,
+	renderFidelity: Enum.RenderFidelity,
+}
+
 --- Apply snapshot instances to the workspace
 function AzulService.applySnapshotInstances(
 	instances: { InstanceData },
 	destination: { string }?
 ): (number, number, { [string]: Instance })
 	-- Sort instances by path length to make sure parents are created before children
-	table.sort(instances, function(a, b)
-		return #a.path < #b.path
-	end)
+	table.sort(instances, function(a, b) return #a.path < #b.path end)
 
-	local function isScriptClass(className: string): boolean
-		return className == "Script" or className == "LocalScript" or className == "ModuleScript"
+	--[=[
+		Extract MeshId from properties if present and valid. We need to do this before instance creation because MeshId is a special case that requires creating the MeshPart via InsertService with the content ID, and we want to avoid applying it as a normal property which would fail and log errors.
+	]=]
+	local function extractMeshId(properties: { [string]: any }?): string?
+		if type(properties) ~= "table" then return nil end
+
+		-- Roblox migrated MeshId to the Content-typed MeshContent, which is what
+		-- current snapshots carry. Pack version 1 sourcemaps still hold MeshId as
+		-- a plain content string.
+		if properties.MeshContent ~= nil then
+			local content = Serializer.deserializeValue(properties.MeshContent)
+			if typeof(content) == "Content" then
+				local uri = content.Uri
+				if type(uri) == "string" and uri ~= "" then return uri end
+			end
+		end
+
+		if properties.MeshId ~= nil then
+			local value = Serializer.deserializeValue(properties.MeshId)
+			if type(value) == "string" and value ~= "" then return value end
+		end
+
+		return nil
+	end
+
+	local function getMeshData(properties: { [string]: any }?): MeshData?
+		if type(properties) ~= "table" then return nil end
+		local meshId = extractMeshId(properties)
+		if not meshId then return nil end
+		local collisionFidelity = Enum.CollisionFidelity.Default :: Enum.CollisionFidelity
+		local renderFidelity = Enum.RenderFidelity.Automatic :: Enum.RenderFidelity
+
+		if properties["CollisionFidelity"] then
+			collisionFidelity = Serializer.deserializeValue(properties["CollisionFidelity"])
+		end
+
+		if properties["RenderFidelity"] then
+			renderFidelity = Serializer.deserializeValue(properties["RenderFidelity"])
+		end
+
+		return {
+			meshId = meshId,
+			collisionFidelity = collisionFidelity,
+			renderFidelity = renderFidelity,
+		}
+	end
+
+	--[=[
+		Strip the MeshId property from instance properties before creating the instance.
+	]=]
+	local function stripMeshId(properties: { [string]: any }?): { [string]: any }?
+		if type(properties) ~= "table" then return nil end
+		local filtered = {}
+		local hasValues = false
+		for key, value in properties do
+			if key ~= "MeshId" and key ~= "MeshContent" then
+				filtered[key] = value
+				hasValues = true
+			end
+		end
+		if not hasValues then return {} end
+		return filtered
+	end
+
+	local function recreateMeshPart(
+		existing: MeshPart,
+		meshData: MeshData,
+		targetName: string,
+		targetParent: Instance?
+	): MeshPart?
+		local okCreate, newMeshPart = pcall(
+			function()
+				return InsertService:CreateMeshPartAsync(
+					meshData.meshId,
+					meshData.collisionFidelity,
+					meshData.renderFidelity
+				)
+			end
+		)
+		if not okCreate or not newMeshPart then return nil end
+
+		newMeshPart.Name = targetName
+		for _, child in existing:GetChildren() do
+			child.Parent = newMeshPart
+		end
+		newMeshPart.Parent = targetParent or existing.Parent
+		existing:Destroy()
+		return newMeshPart
 	end
 
 	--[=[
@@ -294,7 +393,7 @@ function AzulService.applySnapshotInstances(
 		lockedContainerParentsMap: { [string]: string }
 	): ({ string }, string?)
 		local adjustedPath = {}
-		for i, segment in ipairs(pathSegments) do
+		for i, segment in pathSegments do
 			adjustedPath[i] = segment
 		end
 
@@ -313,10 +412,23 @@ function AzulService.applySnapshotInstances(
 		return adjustedPath, protectedContainerName
 	end
 
-	local siblingOrdinalByPathClass: { [string]: number } = {}
-	local existingInstancesByGuid: { [string]: Instance } = {}
-	local initialStudioGuids: { [string]: boolean } = {}
+	local siblingOrdinalsByParent: { [Instance]: { [string]: number } } = {}
 	local resolvedInstancesByGuid: { [string]: Instance } = {}
+	-- Instances created or matched by this snapshot
+	local claimedInstances: { [Instance]: true } = {}
+
+	-- Classes the snapshot holds for each same-named sibling group, keyed by parent & path
+	local function siblingKey(item: InstanceData): string
+		return `{item.parentGuid or ""}\0{table.concat(item.path, "/")}`
+	end
+	local snapshotClassesBySibling: { [string]: { [string]: true } } = {}
+	for _, item in instances do
+		local key = siblingKey(item)
+		local classes = snapshotClassesBySibling[key] or {}
+		classes[item.className] = true
+		snapshotClassesBySibling[key] = classes
+	end
+
 	local deferredPropertyApplications: { { instance: Instance, properties: { [string]: any }? } } = {}
 
 	local lockedContainerParents = {
@@ -327,26 +439,15 @@ function AzulService.applySnapshotInstances(
 
 	local created = 0
 	local updated = 0
-	local guidMatchCount = 0
 	local fallbackMatchCount = 0
-
-	for _, existing in ipairs(game:GetDescendants()) do
-		local guid = existing:GetDebugId(0)
-		if type(guid) == "string" and guid ~= "" then
-			existingInstancesByGuid[guid] = existing
-			initialStudioGuids[guid] = true
-		end
-	end
 
 	local function findInstanceByPath(pathSegments: { string }): Instance?
 		local current: Instance = game
-		for index, segment in ipairs(pathSegments) do
+		for index, segment in pathSegments do
 			local nextNode: Instance? = nil
 
 			if index == 1 then
-				local okService, service = pcall(function()
-					return game:GetService(segment)
-				end)
+				local okService, service = pcall(function() return game:GetService(segment) end)
 				if okService and service then nextNode = service end
 			end
 
@@ -358,7 +459,7 @@ function AzulService.applySnapshotInstances(
 		return current
 	end
 
-	for _, item in instances do
+	local function applyItem(item: InstanceData)
 		debugPrint(
 			`Processing snapshot instance "{item.name}" ({item.className}) with path {table.concat(item.path, "/")}`
 		)
@@ -368,9 +469,7 @@ function AzulService.applySnapshotInstances(
 		-- Get service candidate for the top-level node
 		local serviceCandidate: Instance? = nil
 		if #adjustedPath == 1 then
-			local okService, service = pcall(function()
-				return game:GetService(adjustedPath[1])
-			end)
+			local okService, service = pcall(function() return game:GetService(adjustedPath[1]) end)
 			if okService then serviceCandidate = service end
 		end
 
@@ -380,81 +479,51 @@ function AzulService.applySnapshotInstances(
 			parentPath[i] = adjustedPath[i]
 		end
 
-		-- Only use parent GUID resolution if there's no explicit destination override,
-		-- an explicit destination implies the user ran a push with a specific destination target.
-		local useParentGuidResolution = not destination or #destination == 0
+		-- GUIDs only identify instances within this snapshot, never Studio instances (whose DebugIds are per session)
 		local parent: Instance? = nil
-		if
-			useParentGuidResolution
-			and type(item.parentGuid) == "string"
-			and item.parentGuid ~= ""
-			and item.parentGuid ~= "root"
-		then
-			parent = resolvedInstancesByGuid[item.parentGuid] or existingInstancesByGuid[item.parentGuid]
+		if type(item.parentGuid) == "string" and item.parentGuid ~= "" and item.parentGuid ~= "root" then
+			parent = resolvedInstancesByGuid[item.parentGuid]
 		end
 		if not parent then parent = AzulService.getOrCreatePath(parentPath) end
 
 		debugPrint(`Determined parent for instance "{item.name}" ({item.className}): {tostring(parent)}`)
 
 		local targetName = adjustedPath[#adjustedPath]
-		if isScriptClass(item.className) then
-			local sameNameChildren = {}
-			local hasPreExistingSameNamed = false
 
-			-- Check for same-named children to determine if we need to preserve any due to studio GUID matches
-			for _, child in ipairs((parent :: Instance):GetChildren()) do
-				if child.Name == targetName and child.ClassName == item.className then
+		local existing: Instance? = serviceCandidate
+		if existing then
+			fallbackMatchCount += 1
+		end
+
+		if not existing then
+			-- Counted per parent instance, since same-named parents share a path
+			local ordinals = siblingOrdinalsByParent[parent :: Instance] or {}
+			siblingOrdinalsByParent[parent :: Instance] = ordinals
+			local occurrenceKey = targetName .. "::" .. tostring(item.className)
+			local occurrenceOrdinal = (ordinals[occurrenceKey] or 0) + 1
+			ordinals[occurrenceKey] = occurrenceOrdinal
+
+			local sameNameChildren = {}
+			-- A script that changed class (i.e. Script -> LocalScript) replaces its old self, but never a sibling
+			-- this snapshot claimed, or one whose class the snapshot also holds (a later item will claim it)
+			local snapshotClasses = snapshotClassesBySibling[siblingKey(item)]
+			local classChangedScript: Instance? = nil
+			for _, child in (parent :: Instance):GetChildren() do
+				if child.Name ~= targetName then continue end
+				if child.ClassName == item.className then
 					table.insert(sameNameChildren, child)
-					local childGuid = child:GetDebugId(0)
-					if type(childGuid) == "string" and childGuid ~= "" and initialStudioGuids[childGuid] then
-						hasPreExistingSameNamed = true
-					end
+				elseif
+					not classChangedScript
+					and AzulService.isScriptClass(item.className)
+					and AzulService.isScript(child)
+					and not claimedInstances[child]
+					and not snapshotClasses[child.ClassName]
+				then
+					classChangedScript = child
 				end
 			end
 
-			-- If the target is a script and there's a pre-existing same-named script with a studio GUID, skip destroying it to avoid breaking references in the script editor.
-			-- Instead, we'll treat it as a candidate for reuse and overwrite its source and properties.
-			if hasPreExistingSameNamed then
-				for _, child in ipairs(sameNameChildren) do
-					if not AzulService.isProtectedRobloxContainer(child) then
-						local childGuid = child:GetDebugId(0)
-						if type(childGuid) == "string" and childGuid ~= "" then
-							existingInstancesByGuid[childGuid] = nil
-							resolvedInstancesByGuid[childGuid] = nil
-						end
-						child:Destroy()
-					end
-				end
-			end
-		end
-
-		local existing: Instance? = nil
-		if type(item.guid) == "string" and item.guid ~= "" then
-			existing = existingInstancesByGuid[item.guid]
-			if existing then
-				guidMatchCount += 1
-			end
-		end
-
-		if not existing then
-			existing = serviceCandidate
-			if existing then
-				fallbackMatchCount += 1
-			end
-		end
-
-		if not existing then
-			local targetClassName = item.className
-			local occurrenceKey = table.concat(adjustedPath, "\u{1F}") .. "::" .. tostring(targetClassName)
-			local occurrenceOrdinal = (siblingOrdinalByPathClass[occurrenceKey] or 0) + 1
-			siblingOrdinalByPathClass[occurrenceKey] = occurrenceOrdinal
-
-			local sameNameChildren = {}
-			for _, child in ipairs((parent :: Instance):GetChildren()) do
-				if child.Name == targetName then table.insert(sameNameChildren, child) end
-			end
-
-			existing = sameNameChildren[occurrenceOrdinal]
+			existing = sameNameChildren[occurrenceOrdinal] or classChangedScript
 			if existing then
 				fallbackMatchCount += 1
 			end
@@ -463,7 +532,7 @@ function AzulService.applySnapshotInstances(
 		local instance = existing
 
 		if existing and existing.ClassName ~= item.className then
-			local targetIsScript = isScriptClass(item.className)
+			local targetIsScript = AzulService.isScriptClass(item.className)
 			if targetIsScript then
 				if AzulService.isProtectedRobloxContainer(existing) then
 					instance = existing
@@ -479,9 +548,7 @@ function AzulService.applySnapshotInstances(
 		if not instance and protectedContainerName then
 			local protectedParentName = lockedContainerParents[protectedContainerName]
 			if protectedParentName then
-				local okParent, protectedParent = pcall(function()
-					return game:GetService(protectedParentName)
-				end)
+				local okParent, protectedParent = pcall(function() return game:GetService(protectedParentName) end)
 				if okParent and protectedParent then
 					local protectedExisting = protectedParent:FindFirstChild(protectedContainerName)
 					if protectedExisting then instance = protectedExisting end
@@ -489,16 +556,43 @@ function AzulService.applySnapshotInstances(
 			end
 		end
 
-		if not instance then
-			local newInstance
-			local okNew, createdInstance = pcall(function()
-				return Instance.new(item.className)
-			end)
-			if okNew and createdInstance then
-				newInstance = createdInstance
-			else
-				newInstance = Instance.new("Folder")
-				debugPrint(`Failed to create instance of class "{item.className}", created Folder placeholder instead.`)
+		if not instance then -- If we still don't have an existing instance, create it
+			local newInstance: Instance
+			if item.className == "MeshPart" then
+				local meshData = getMeshData(item.properties)
+				if meshData then
+					local content = Content.fromUri(meshData.meshId)
+					local okMesh, meshResult = pcall(
+						function()
+							return InsertService:CreateMeshPartAsync(
+								meshData.meshId,
+								meshData.collisionFidelity,
+								meshData.renderFidelity
+							)
+						end
+					)
+
+					if okMesh and meshResult then
+						newInstance = meshResult
+					elseif not okMesh then
+						warn(
+							`[AzulService]: Failed to create MeshPart for instance "{item.name}" with MeshId "{meshData.meshId}": {tostring(
+								meshResult
+							)}.`
+						)
+					end
+				end
+			end
+			if not newInstance then
+				local okNew, createdInstance = pcall(function() return Instance.new(item.className) end)
+				if okNew and createdInstance then
+					newInstance = createdInstance
+				else
+					newInstance = Instance.new("Folder")
+					debugPrint(
+						`Failed to create instance of class "{item.className}", created Folder placeholder instead.`
+					)
+				end
 			end
 			newInstance.Name = adjustedPath[#adjustedPath]
 			newInstance.Parent = parent :: Instance
@@ -506,9 +600,7 @@ function AzulService.applySnapshotInstances(
 			created += 1
 		else
 			if parent and instance.Parent ~= parent and not AzulService.isProtectedRobloxContainer(instance) then
-				local okReparent = pcall(function()
-					instance.Parent = parent :: Instance
-				end)
+				local okReparent = pcall(function() instance.Parent = parent :: Instance end)
 				if not okReparent then
 					debugPrint(`Failed to reparent instance "{instance.Name}" ({instance.ClassName}) to target parent.`)
 				end
@@ -519,22 +611,31 @@ function AzulService.applySnapshotInstances(
 			end
 		end
 
-		if instance then
-			if type(item.guid) == "string" and item.guid ~= "" then
-				existingInstancesByGuid[item.guid] = instance
-				resolvedInstancesByGuid[item.guid] = instance
+		if instance then -- Apply properties, attributes, and tags if we have a valid instance
+			if item.className == "MeshPart" and instance:IsA("MeshPart") then
+				local meshData = getMeshData(item.properties)
+				if meshData and meshData.meshId ~= (instance :: MeshPart).MeshId then
+					local replaced = recreateMeshPart(instance :: MeshPart, meshData, targetName, parent)
+					if replaced then instance = replaced end
+				end
 			end
+
+			claimedInstances[instance] = true
+			if type(item.guid) == "string" and item.guid ~= "" then resolvedInstancesByGuid[item.guid] = instance end
+
+			local propertiesForApply = item.properties
+			if instance:IsA("MeshPart") then propertiesForApply = stripMeshId(propertiesForApply) end
 
 			table.insert(deferredPropertyApplications, {
 				instance = instance,
-				properties = item.properties,
+				properties = propertiesForApply,
 			})
 
 			Serializer.applySerializedAttributes(instance, item.attributes)
 			Serializer.applySerializedTags(instance, item.tags)
 		end
 
-		if isScriptClass(item.className) and item.source and instance then
+		if AzulService.isScriptClass(item.className) and item.source and instance then
 			if AzulService.isScript(instance) then
 				AzulService.setScriptSource(instance :: Script, item.source)
 				updated += 1
@@ -546,19 +647,30 @@ function AzulService.applySnapshotInstances(
 		end
 	end
 
-	for _, pending in ipairs(deferredPropertyApplications) do
-		Serializer.applySerializedProperties(pending.instance, pending.properties, {
-			resolveInstanceByGuid = function(guid: string): Instance?
-				return resolvedInstancesByGuid[guid]
-			end,
-			resolveInstanceByPath = function(pathSegments: { string }): Instance?
-				return findInstanceByPath(pathSegments)
-			end,
-		})
+	-- Isolate each instance so one failure (e.g. a protected Name write) doesn't abort the build before properties are applied
+	for _, item in instances do
+		local ok, err: string? = pcall(applyItem, item)
+		if not ok then warn(`[AzulService]: Skipped snapshot instance "{item.name}" ({item.className}): {err}`) end
+	end
+
+	for _, pending in deferredPropertyApplications do
+		local ok, err: string? = pcall(function()
+			Serializer.applySerializedProperties(pending.instance, pending.properties, {
+				resolveInstanceByGuid = function(guid: string): Instance? return resolvedInstancesByGuid[guid] end,
+				resolveInstanceByPath = function(pathSegments: { string }): Instance?
+					return findInstanceByPath(pathSegments)
+				end,
+			})
+		end)
+		if not ok then
+			warn(
+				`[AzulService]: Failed to apply properties for instance "{pending.instance.Name}" ({pending.instance.ClassName}): {err}`
+			)
+		end
 	end
 
 	debugPrint(
-		`Snapshot resolve summary: {guidMatchCount} guid matches, {fallbackMatchCount} fallback matches, {created} created, {updated} scripts updated`
+		`Snapshot resolve summary: {fallbackMatchCount} fallback matches, {created} created, {updated} scripts updated`
 	)
 
 	return created, updated, resolvedInstancesByGuid
@@ -567,11 +679,9 @@ end
 --- Find the push config ModuleScript
 function AzulService.findPushConfigModule(pushConfigPath: { string }): ModuleScript?
 	local current: Instance = game
-	for index, segment in ipairs(pushConfigPath) do
+	for index, segment in pushConfigPath do
 		if index == 1 then
-			local ok, service = pcall(function()
-				return game:GetService(segment)
-			end)
+			local ok, service = pcall(function() return game:GetService(segment) end)
 			if not ok or not service then return nil end
 			current = service
 		else
@@ -590,6 +700,7 @@ end
 function AzulService.readPushConfig(pushConfigPath: { string }): ({ [string]: any }?, string?)
 	local module = AzulService.findPushConfigModule(pushConfigPath)
 	if not module then return nil, "Push config ModuleScript not found" end
+	PlaceConfig.ensureTypes(module)
 
 	-- Clone module to force require to refresh data
 	local moduleClone = module:Clone()
@@ -605,12 +716,18 @@ function AzulService.readPushConfig(pushConfigPath: { string }): ({ [string]: an
 
 	debugPrint(`Push config loaded from {module}: {HttpService:JSONEncode(data)}`)
 
+	for key in data do
+		if not PlaceConfig.KNOWN_KEYS[key] then
+			warn(`[Azul]: Unknown key "{tostring(key)}" in {module:GetFullName()} is ignored`)
+		end
+	end
+
 	local mappings = {}
 	if type(data.pushMappings) == "table" then
-		for _, entry in ipairs(data.pushMappings) do
+		for _, entry in data.pushMappings do
 			if type(entry) == "table" and type(entry.source) == "string" and type(entry.destination) == "table" then
 				local dest = {}
-				for _, seg in ipairs(entry.destination) do
+				for _, seg in entry.destination do
 					if type(seg) == "string" and seg ~= "" then table.insert(dest, seg) end
 				end
 
@@ -634,9 +751,27 @@ function AzulService.readPushConfig(pushConfigPath: { string }): ({ [string]: an
 		port = data.port,
 		debugMode = data.debugMode,
 		deleteOrphansOnConnect = data.deleteOrphansOnConnect,
+		packOnExit = if type(data.packOnExit) == "table"
+			then {
+				enabled = data.packOnExit.enabled == true,
+				outputPath = if type(data.packOnExit.outputPath) == "string"
+						and data.packOnExit.outputPath ~= ""
+					then data.packOnExit.outputPath
+					else nil,
+			}
+			else nil,
 	}
 
 	return configPayload, nil
+end
+
+function AzulService.parseCommaSeparatedList(str: string): { string }
+	local result = {}
+	for segment in str:gmatch("([^,]+)") do
+		local trimmed = segment:match("^%s*(.-)%s*$")
+		if trimmed and trimmed ~= "" then table.insert(result, trimmed) end
+	end
+	return result
 end
 
 return AzulService

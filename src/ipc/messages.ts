@@ -24,6 +24,7 @@ export interface InstanceData {
   path: string[]; // ["ReplicatedStorage", "Modules", "Foo"]
   parentGuid?: string | null; // parent instance GUID
   source?: string; // Only present for Script/LocalScript/ModuleScript
+  filePath?: string; // Absolute path of the script file this instance was built from
   properties?: Record<string, unknown>;
   attributes?: Record<string, unknown>;
   tags?: string[];
@@ -42,9 +43,11 @@ export type StudioPayloadMessage =
   | InstanceUpdatedMessage
   | ScriptChangedMessage
   | DeletedMessage
+  | StudioOutputMessage
   | PingMessage
   | ClientDisconnect
-  | PushConfigMessage;
+  | PushConfigMessage
+  | HandshakeMessageStudio;
 
 export interface BatchMessage {
   type: "batch";
@@ -56,6 +59,7 @@ export type StudioMessage = StudioPayloadMessage | BatchMessage;
 export interface FullSnapshotMessage {
   type: "fullSnapshot";
   data: InstanceData[];
+  placeId?: number;
 }
 
 export interface InstanceUpdatedMessage {
@@ -80,6 +84,16 @@ export interface DeletedMessage {
   };
 }
 
+/** Playtest output relayed from a Solo server or client DataModel */
+export interface StudioOutputMessage {
+  type: "studioOutput";
+  message: string;
+  messageType: string;
+  source: "server" | "client";
+  /** Unix time in milliseconds when the message was logged */
+  timestamp: number;
+}
+
 export interface PingMessage {
   type: "ping";
 }
@@ -93,6 +107,16 @@ export interface PushConfigMessage {
   config: PushConfig;
 }
 
+export interface HandshakeAckMessage {
+  type: "handshakeAck";
+  version: string;
+}
+
+export interface HandshakeMessageStudio {
+  type: "handshakeStudio";
+  version?: string; // absent on plugins older than 2.0.0
+}
+
 /**
  * Messages from Daemon → Studio
  */
@@ -101,10 +125,15 @@ export type DaemonMessage =
   | RequestSnapshotMessage
   | PongMessage
   | DaemonDisconnectMessage
+  | DaemonBusyMessage
   | ErrorMessage
   | BuildSnapshotMessage
   | RequestPushConfigMessage
-  | PushSnapshotMessage;
+  | PushSnapshotMessage
+  | HandshakeAckMessage
+  | CreateInstanceMessage
+  | DeleteInstanceMessage
+  | MoveInstanceMessage;
 
 export interface PatchScriptMessage {
   type: "patchScript";
@@ -121,8 +150,43 @@ export interface PongMessage {
   type: "pong";
 }
 
+export interface CreateInstanceMessage {
+  type: "createInstance";
+  className: InstanceClassName;
+  name: string;
+  parentPath: string[];
+  source?: string;
+}
+
+export interface DeleteInstanceMessage {
+  type: "deleteInstance";
+  guid?: string;
+  path?: string[];
+}
+
+/**
+ * Move/rename an existing instance (by GUID) to a new parent path and name.
+ * className/source are only set when a filesystem rename implies a class
+ * change (e.g. Foo.luau -> Foo.server.luau); Roblox can't change ClassName in
+ * place, so the plugin recreates the instance as the new class instead of a
+ * plain reparent.
+ */
+export interface MoveInstanceMessage {
+  type: "moveInstance";
+  guid: string;
+  parentPath: string[];
+  name: string;
+  className?: InstanceClassName;
+  source?: string;
+}
+
 export interface DaemonDisconnectMessage {
   type: "daemonDisconnect";
+}
+
+/** Sent to a Studio client rejected because another session already uses the daemon. */
+export interface DaemonBusyMessage {
+  type: "daemonBusy";
 }
 
 export interface ErrorMessage {
@@ -156,6 +220,13 @@ export interface PushConfig {
   port?: number;
   debugMode?: boolean;
   deleteOrphansOnConnect?: boolean;
+  packOnExit?: PackOnExitConfig;
+}
+
+/** Packs the place into `outputPath` when the live daemon is stopped while Studio is connected. */
+export interface PackOnExitConfig {
+  enabled: boolean;
+  outputPath?: string;
 }
 
 export interface PushConfigMapping {

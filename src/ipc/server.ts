@@ -1,8 +1,15 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { log } from "../util/log.js";
 import type { StudioMessage, DaemonMessage } from "./messages.js";
+import { isStudioOutputMessage } from "../studioOutput.js";
 import type { SnapshotRequestOptions } from "./messages.js";
 import type { Server as HttpServer } from "http";
+import {
+  getCurrentVersion,
+  isVersionCompatible,
+} from "../util/versionUtils.js";
+
+const DAEMON_VERSION = getCurrentVersion();
 
 export type MessageHandler = (message: StudioMessage) => void;
 
@@ -15,8 +22,13 @@ export class IPCServer {
   private client: WebSocket | null = null;
   private messageHandler: MessageHandler | null = null;
   private connectionHandler: (() => void) | null = null;
+  private disconnectHandler: (() => void) | null = null;
+  private handshakeHandler: (() => void) | null = null;
   private requestSnapshotOnConnect: boolean;
   private pingIntervals = new Map<WebSocket, NodeJS.Timeout>();
+  private outputClients = new Set<WebSocket>();
+  private closePromise: Promise<void> | null = null;
+  private handshakeComplete = false;
 
   constructor(port?: number, server?: HttpServer, options?: IPCServerOptions) {
     this.requestSnapshotOnConnect = options?.requestSnapshotOnConnect !== false;
@@ -30,7 +42,7 @@ export class IPCServer {
     } else {
       // Create standalone WebSocket server
       this.wss = new WebSocketServer({
-        port: port || 8080,
+        port: port ?? 8080,
         // perMessageDeflate: false, // avoid RSV2/RSV3 bits from compression
         maxPayload: 256 * 1024 * 1024, // 256 MB
       });
@@ -39,17 +51,36 @@ export class IPCServer {
   }
 
   private setupServer(): void {
-    this.wss.on("connection", (ws) => {
+    this.wss.on("connection", (ws, request) => {
+      if (
+        new URL(request.url ?? "/", "http://localhost").pathname ===
+        "/studio-output"
+      ) {
+        this.handleOutputConnection(ws);
+        return;
+      }
+
+      // One Studio session per daemon: a second one would overwrite the first's files
+      if (this.isConnected()) {
+        log.warn(
+          "Rejected a Studio connection: another Studio session is already syncing with this daemon",
+        );
+        const busy: DaemonMessage = { type: "daemonBusy" };
+        ws.send(JSON.stringify(busy), () => ws.close());
+        return;
+      }
+
       log.info("Studio client connected");
       log.info("Waiting for Studio messages...");
 
-      // Disconnect previous client if exists
+      // A previous client that is still closing is replaced
       if (this.client) {
-        log.warn("Disconnecting previous client");
+        this.closeOutputClients();
         this.client.close();
       }
 
       this.client = ws;
+      this.handshakeComplete = false;
 
       if (this.connectionHandler) {
         this.connectionHandler();
@@ -59,6 +90,11 @@ export class IPCServer {
         try {
           const message: StudioMessage = JSON.parse(data.toString());
           log.debug(`Received: ${message.type}`);
+
+          if (message.type === "handshakeStudio") {
+            void this.handleHandshake(message.version);
+            return;
+          }
 
           if (this.messageHandler) {
             this.messageHandler(message);
@@ -76,8 +112,16 @@ export class IPCServer {
           this.pingIntervals.delete(ws);
         }
 
+        // A replaced socket closing late must not tear down its successor
+        if (this.client !== ws) {
+          return;
+        }
+
         log.info("Studio client disconnected");
         this.client = null;
+        this.handshakeComplete = false;
+        this.closeOutputClients();
+        this.disconnectHandler?.();
       });
 
       ws.on("error", (error) => {
@@ -120,6 +164,45 @@ export class IPCServer {
   }
 
   /**
+   * Handles the handshake process with the Studio client, verifying version compatibility and sending a handshake acknowledgment.
+   * If the versions are incompatible, it throws an error and disconnects the client.
+   */
+  private async handleHandshake(pluginVersion?: string): Promise<void> {
+    pluginVersion =
+      typeof pluginVersion === "string" ? pluginVersion : undefined;
+
+    if (!pluginVersion || !isVersionCompatible(pluginVersion, DAEMON_VERSION)) {
+      const message = `Version mismatch: plugin v${pluginVersion ?? "unknown"}, daemon v${DAEMON_VERSION}. Update both to matching versions.`;
+
+      this.sendError(message);
+      this.send({ type: "daemonDisconnect" }); // stops the plugin's sync session
+      await this.close();
+
+      log.error(`VERSION MISMATCH:`);
+      log.error(
+        `- Your Plugin version: ${pluginVersion ?? "unknown (needs update)"}`,
+      );
+      log.error(`- Your Daemon version: ${DAEMON_VERSION}`);
+      log.error(`Make sure both are updated and using matching versions!`);
+      if (!pluginVersion) {
+        log.error(
+          `If the Plugin is up to date but still shows "unknown", please open an issue.`,
+        );
+      }
+
+      throw new Error(message);
+    }
+
+    if (!this.handshakeComplete) {
+      this.handshakeComplete = true;
+      if (this.handshakeHandler) {
+        this.handshakeHandler();
+      }
+    }
+    this.send({ type: "handshakeAck", version: DAEMON_VERSION });
+  }
+
+  /**
    * Register a handler for incoming Studio messages
    */
   public onMessage(handler: MessageHandler): void {
@@ -131,6 +214,67 @@ export class IPCServer {
    */
   public onConnection(handler: () => void): void {
     this.connectionHandler = handler;
+  }
+
+  /**
+   * Register a handler that fires when the Studio client's socket closes
+   */
+  public onDisconnect(handler: () => void): void {
+    this.disconnectHandler = handler;
+  }
+
+  /**
+   * Register a handler that fires when Studio completes the handshake
+   */
+  public onHandshake(handler: () => void): void {
+    this.handshakeHandler = handler;
+    if (this.handshakeComplete) {
+      handler();
+    }
+  }
+
+  /**
+   * Accept a playtest output relay socket while the main Studio client is connected.
+   * Relays are auxiliary: they never replace or affect the main sync connection.
+   */
+  private handleOutputConnection(ws: WebSocket): void {
+    if (!this.client) {
+      ws.terminate();
+      return;
+    }
+
+    if (this.outputClients.size === 0) {
+      log.playtest("started");
+    }
+    this.outputClients.add(ws);
+
+    ws.once("close", () => {
+      if (this.outputClients.delete(ws) && this.outputClients.size === 0) {
+        log.playtest("ended");
+      }
+    });
+
+    ws.on("error", (error) => {
+      log.error("WebSocket error:", error);
+    });
+
+    ws.on("message", (data) => {
+      try {
+        const message: unknown = JSON.parse(data.toString());
+        if (isStudioOutputMessage(message) && this.messageHandler) {
+          this.messageHandler(message);
+        }
+      } catch (error) {
+        log.error("Failed to parse playtest output message:", error);
+      }
+    });
+  }
+
+  /** Terminate every output relay; their close handlers remove them from the set. */
+  private closeOutputClients(): void {
+    for (const client of this.outputClients) {
+      client.terminate();
+    }
   }
 
   /**
@@ -159,6 +303,56 @@ export class IPCServer {
     return this.send({
       type: "patchScript",
       guid,
+      source,
+    });
+  }
+
+  /**
+   * Tell Studio to create a new instance (script or folder)
+   */
+  public createInstance(
+    className: string,
+    name: string,
+    parentPath: string[],
+    source?: string,
+  ): boolean {
+    return this.send({
+      type: "createInstance",
+      className,
+      name,
+      parentPath,
+      source,
+    });
+  }
+
+  /**
+   * Tell Studio to delete an instance by GUID or path
+   */
+  public deleteInstance(guid?: string, instancePath?: string[]): boolean {
+    return this.send({
+      type: "deleteInstance",
+      guid,
+      path: instancePath,
+    });
+  }
+
+  /**
+   * Tell Studio to move/rename an existing instance by GUID, preserving its
+   * descendants (including non-script instances not represented on disk).
+   */
+  public moveInstance(
+    guid: string,
+    parentPath: string[],
+    name: string,
+    className?: string,
+    source?: string,
+  ): boolean {
+    return this.send({
+      type: "moveInstance",
+      guid,
+      parentPath,
+      name,
+      className,
       source,
     });
   }
@@ -193,17 +387,28 @@ export class IPCServer {
   /**
    * Close the server
    */
-  public close(): void {
+  public close(): Promise<void> {
+    if (this.closePromise) {
+      return this.closePromise;
+    }
+
     for (const interval of this.pingIntervals.values()) {
       clearInterval(interval);
     }
     this.pingIntervals.clear();
 
     if (this.client) {
-      this.client.close();
+      this.client.terminate();
       this.client = null;
     }
-    this.wss.close();
-    log.info("WebSocket server closed.");
+    this.closeOutputClients();
+
+    this.closePromise = new Promise((resolve) => {
+      this.wss.close(() => {
+        log.info("WebSocket server closed.");
+        resolve();
+      });
+    });
+    return this.closePromise;
   }
 }

@@ -1,9 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { IPCServer } from "./ipc/server.js";
+import { FileWriter } from "./fs/fileWriter.js";
+import type { TreeNode } from "./fs/treeManager.js";
 import { config } from "./config.js";
 import { log } from "./util/log.js";
+import { isScriptClassName } from "./util/scriptFile.js";
 import type {
+  FullSnapshotMessage,
   InstanceData,
   SnapshotRequestOptions,
   StudioMessage,
@@ -14,7 +18,7 @@ interface PackOptions {
   scriptsAndDescendantsOnly?: boolean;
 }
 
-interface SourcemapNode {
+export interface SourcemapNode {
   name: string;
   className: string;
   guid?: string;
@@ -25,7 +29,7 @@ interface SourcemapNode {
   tags?: string[];
 }
 
-interface SourcemapRoot {
+export interface SourcemapRoot {
   name: string;
   className: string;
   children: SourcemapNode[];
@@ -33,11 +37,15 @@ interface SourcemapRoot {
     packVersion?: number;
     packedAt?: string;
     mode?: "all" | "scripts-and-descendants";
+    placeId?: number;
   };
 }
 
-const PACK_VERSION = 1;
+const PACK_VERSION = 2;
 
+/**
+ * Packs a one-shot snapshot from Studio into a sourcemap.json.
+ */
 export class PackCommand {
   private ipc: IPCServer;
   private outputPath: string;
@@ -51,7 +59,11 @@ export class PackCommand {
     });
   }
 
-  public async run(): Promise<void> {
+  /**
+   * Packs Studio's state into the output sourcemap.
+   * @returns Whether a sourcemap was written.
+   */
+  public async run(): Promise<boolean> {
     log.info(`Waiting for Studio to connect on port ${config.port}...`);
     const snapshot = await this.requestSnapshot({
       includeProperties: true,
@@ -60,25 +72,26 @@ export class PackCommand {
 
     if (!snapshot) {
       log.error("Failed to receive snapshot from Studio for packing.");
-      return;
+      return false;
     }
 
-    const existing = this.readExistingSourcemap();
-    const regenerated = this.regenerateSourcemap(snapshot, existing);
-    const packedCount = this.packIntoSourcemap(snapshot, regenerated);
-
-    this.writeSourcemap(regenerated, this.outputPath);
+    const { sourcemap, packedCount } = this.buildSourcemap(
+      snapshot.data,
+      snapshot.placeId,
+    );
+    writePackedSourcemap(sourcemap, this.outputPath);
     log.success(`Packed ${packedCount} node(s) into ${this.outputPath}`);
+    return true;
   }
 
   private async requestSnapshot(
     options: SnapshotRequestOptions,
-  ): Promise<InstanceData[] | null> {
-    return new Promise<InstanceData[] | null>((resolve) => {
+  ): Promise<FullSnapshotMessage | null> {
+    return new Promise<FullSnapshotMessage | null>((resolve) => {
       let timeoutHandle: NodeJS.Timeout | null = null;
       let resolved = false;
 
-      const finalize = (result: InstanceData[] | null): void => {
+      const finalize = (result: FullSnapshotMessage | null): void => {
         if (resolved) return;
         resolved = true;
 
@@ -87,20 +100,23 @@ export class PackCommand {
           timeoutHandle = null;
         }
 
-        setTimeout(() => {
-          this.ipc.close();
+        setTimeout(async () => {
+          await this.ipc.close();
+          resolve(result);
         }, 200);
-
-        resolve(result);
       };
 
       this.ipc.onMessage((message: StudioMessage) => {
         if (message.type !== "fullSnapshot") return;
-        finalize(message.data);
+        finalize(message);
       });
 
       this.ipc.onConnection(() => {
-        log.info("Studio connected. Requesting snapshot...");
+        log.info("Studio connected. Waiting for handshake...");
+      });
+
+      this.ipc.onHandshake(() => {
+        log.info("Handshake complete. Requesting snapshot...");
         this.ipc.requestSnapshot(options);
       });
 
@@ -111,209 +127,173 @@ export class PackCommand {
     });
   }
 
-  private readExistingSourcemap(): SourcemapRoot | null {
-    if (!fs.existsSync(this.outputPath)) {
-      return null;
-    }
-
-    try {
-      const raw = fs.readFileSync(this.outputPath, "utf8");
-      return JSON.parse(raw) as SourcemapRoot;
-    } catch (error) {
-      log.warn(
-        `Failed to read existing sourcemap at ${this.outputPath}: ${error}`,
-      );
-      return null;
-    }
-  }
-
-  private regenerateSourcemap(
+  /**
+   * Build a fresh sourcemap straight from the Studio snapshot, writing script files as it goes.
+   */
+  private buildSourcemap(
     snapshot: InstanceData[],
-    existing: SourcemapRoot | null,
-  ): SourcemapRoot {
-    const root: SourcemapRoot = {
-      name: "Game",
-      className: "DataModel",
-      children: [],
-    };
+    placeId?: number,
+  ): {
+    sourcemap: SourcemapRoot;
+    packedCount: number;
+  } {
+    const fileWriter = new FileWriter(config.syncDir);
 
-    const guidFilePaths = new Map<string, string[]>();
-    const pathClassFilePaths = new Map<string, string[][]>();
-    const pathClassCursor = new Map<string, number>();
+    return buildPackedSourcemap(snapshot, {
+      placeId,
+      scriptsAndDescendantsOnly: this.scriptsAndDescendantsOnly,
+      resolveScriptPath: (item) => {
+        const treeNode: TreeNode = {
+          guid: item.guid,
+          className: item.className,
+          name: item.name,
+          path: item.path,
+          source: item.source,
+          children: new Map(),
+        };
 
-    const indexExisting = (
-      node: SourcemapNode,
-      currentPath: string[],
-    ): void => {
-      const nodePath = [...currentPath, node.name];
-      if (node.filePaths && node.filePaths.length > 0) {
-        if (node.guid) {
-          guidFilePaths.set(node.guid, node.filePaths);
-        }
+        fileWriter.writeScript(treeNode);
 
-        const key = this.pathClassKey(nodePath, node.className);
-        const bucket = pathClassFilePaths.get(key) ?? [];
-        bucket.push(node.filePaths);
-        pathClassFilePaths.set(key, bucket);
-      }
-
-      for (const child of node.children ?? []) {
-        indexExisting(child, nodePath);
-      }
-    };
-
-    for (const child of existing?.children ?? []) {
-      indexExisting(child, []);
-    }
-
-    const byGuid = new Map<string, SourcemapNode>();
-    byGuid.set("root", root as unknown as SourcemapNode);
-
-    const sorted = [...snapshot].sort((a, b) => {
-      if (a.path.length !== b.path.length) {
-        return a.path.length - b.path.length;
-      }
-      return a.path.join("/").localeCompare(b.path.join("/"));
+        const filePath = fileWriter.getFilePath(treeNode);
+        if (!fs.existsSync(filePath)) return undefined;
+        fileWriter.remapScript(item.guid, filePath, item.className);
+        return filePath;
+      },
     });
+  }
+}
 
-    for (const item of sorted) {
-      const node: SourcemapNode = {
-        name: item.name,
-        className: item.className,
-        guid: item.guid,
-      };
+/**
+ * Builds a packed sourcemap from a Studio snapshot taken with `includeProperties`.
+ * @param options.resolveScriptPath Returns the absolute file path of a script instance, if it has one.
+ */
+export function buildPackedSourcemap(
+  snapshot: InstanceData[],
+  options: {
+    placeId?: number;
+    scriptsAndDescendantsOnly?: boolean;
+    resolveScriptPath: (item: InstanceData) => string | undefined;
+  },
+): { sourcemap: SourcemapRoot; packedCount: number } {
+  const root: SourcemapRoot = {
+    name: "Game",
+    className: "DataModel",
+    children: [],
+  };
 
-      const directFilePaths = guidFilePaths.get(item.guid);
-      if (directFilePaths && directFilePaths.length > 0) {
-        node.filePaths = directFilePaths;
-      } else {
-        const key = this.pathClassKey(item.path, item.className);
-        const bucket = pathClassFilePaths.get(key);
-        if (bucket && bucket.length > 0) {
-          const cursor = pathClassCursor.get(key) ?? 0;
-          const candidate = bucket[cursor];
-          if (candidate && candidate.length > 0) {
-            node.filePaths = candidate;
-            pathClassCursor.set(key, cursor + 1);
-          }
-        }
-      }
+  const byGuid = new Map<string, SourcemapNode>();
+  byGuid.set("root", root as unknown as SourcemapNode);
 
-      let parentNode = root as SourcemapNode;
-      if (item.parentGuid && item.parentGuid !== "root") {
-        parentNode = byGuid.get(item.parentGuid) ?? root;
-      }
-
-      if (!parentNode.children) {
-        parentNode.children = [];
-      }
-      parentNode.children.push(node);
-      byGuid.set(item.guid, node);
+  const sorted = [...snapshot].sort((a, b) => {
+    if (a.path.length !== b.path.length) {
+      return a.path.length - b.path.length;
     }
+    return a.path.join("/").localeCompare(b.path.join("/"));
+  });
 
-    return root;
+  // Only Ref targets get an ID, numbered in sorted order so an unchanged place packs identically.
+  // Snapshot GUIDs are DebugIds, which change every session.
+  const refTargets = new Set<string>();
+  for (const item of snapshot) {
+    for (const value of Object.values(item.properties ?? {})) {
+      const target = getRefGuid(value);
+      if (target) refTargets.add(target);
+    }
+  }
+  const refIds = new Map<string, string>();
+  for (const item of sorted) {
+    if (refTargets.has(item.guid)) {
+      refIds.set(item.guid, `ref-${refIds.size + 1}`);
+    }
   }
 
-  private packIntoSourcemap(
-    snapshot: InstanceData[],
-    sourcemap: SourcemapRoot,
-  ): number {
-    const byGuid = new Map<string, InstanceData>();
-    const byPathClass = new Map<string, InstanceData[]>();
-    for (const item of snapshot) {
-      byGuid.set(item.guid, item);
-      const key = this.pathClassKey(item.path, item.className);
-      const bucket = byPathClass.get(key) ?? [];
-      bucket.push(item);
-      byPathClass.set(key, bucket);
-    }
+  let packedCount = 0;
 
-    const usedGuids = new Set<string>();
-    let packed = 0;
-
-    const visit = (node: SourcemapNode, currentPath: string[]): void => {
-      const nodePath = [...currentPath, node.name];
-      let match: InstanceData | undefined;
-
-      if (node.guid) {
-        const direct = byGuid.get(node.guid);
-        if (direct) {
-          match = direct;
-          usedGuids.add(direct.guid);
-        }
-      }
-
-      if (!match) {
-        const key = this.pathClassKey(nodePath, node.className);
-        const bucket = byPathClass.get(key);
-        if (bucket && bucket.length > 0) {
-          match = bucket.find((candidate) => !usedGuids.has(candidate.guid));
-          if (match) {
-            usedGuids.add(match.guid);
-          }
-        }
-      }
-
-      if (match) {
-        if (match.properties && Object.keys(match.properties).length > 0) {
-          node.properties = match.properties;
-        } else if (!this.scriptsAndDescendantsOnly) {
-          delete node.properties;
-        }
-
-        if (match.attributes && Object.keys(match.attributes).length > 0) {
-          node.attributes = match.attributes;
-        } else if (!this.scriptsAndDescendantsOnly) {
-          delete node.attributes;
-        }
-
-        if (match.tags && match.tags.length > 0) {
-          node.tags = match.tags;
-        } else if (!this.scriptsAndDescendantsOnly) {
-          delete node.tags;
-        }
-
-        if (match.properties || match.attributes || match.tags) {
-          packed += 1;
-        }
-      } else if (!this.scriptsAndDescendantsOnly) {
-        delete node.properties;
-        delete node.attributes;
-        delete node.tags;
-      }
-
-      for (const child of node.children ?? []) {
-        visit(child, nodePath);
-      }
+  for (const item of sorted) {
+    const node: SourcemapNode = {
+      name: item.name,
+      className: item.className,
     };
+    const refId = refIds.get(item.guid);
+    if (refId) node.guid = refId;
 
-    for (const child of sourcemap.children ?? []) {
-      visit(child, []);
+    if (isScriptClassName(item.className)) {
+      const filePath = options.resolveScriptPath(item);
+      if (filePath) {
+        node.filePaths = [
+          path.relative(process.cwd(), filePath).replace(/\\/g, "/"),
+        ];
+      }
     }
 
-    sourcemap._azul = {
-      packVersion: PACK_VERSION,
-      packedAt: new Date().toISOString(),
-      mode: this.scriptsAndDescendantsOnly ? "scripts-and-descendants" : "all",
-    };
-
-    return packed;
-  }
-
-  private writeSourcemap(sourcemap: SourcemapRoot, outputPath: string): void {
-    const dir = path.dirname(outputPath);
-    if (dir && dir !== "." && !fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    if (item.properties && Object.keys(item.properties).length > 0) {
+      node.properties = Object.fromEntries(
+        Object.entries(item.properties).map(([key, value]) => [
+          key,
+          remapRef(value, refIds),
+        ]),
+      );
+    }
+    if (item.attributes && Object.keys(item.attributes).length > 0) {
+      node.attributes = item.attributes;
+    }
+    if (item.tags && item.tags.length > 0) {
+      node.tags = item.tags;
+    }
+    if (node.properties || node.attributes || node.tags) {
+      packedCount += 1;
     }
 
-    fs.writeFileSync(
-      outputPath,
-      `${JSON.stringify(sourcemap, null, 2)}\n`,
-      "utf8",
-    );
+    const parentNode =
+      (item.parentGuid && byGuid.get(item.parentGuid)) ||
+      (root as unknown as SourcemapNode);
+    if (!parentNode.children) parentNode.children = [];
+    parentNode.children.push(node);
+    byGuid.set(item.guid, node);
   }
 
-  private pathClassKey(pathSegments: string[], className: string): string {
-    return `${pathSegments.join("\u0001")}::${className}`;
+  root._azul = {
+    packVersion: PACK_VERSION,
+    packedAt: new Date().toISOString(),
+    mode: options.scriptsAndDescendantsOnly ? "scripts-and-descendants" : "all",
+    // 0 means the place was never saved to Roblox, so there is nothing to open.
+    placeId:
+      options.placeId && options.placeId > 0 ? options.placeId : undefined,
+  };
+
+  return { sourcemap: root, packedCount };
+}
+
+const getRefGuid = (value: unknown): string | undefined => {
+  const ref = (value as { Ref?: { guid?: unknown } } | null)?.Ref;
+  return typeof ref?.guid === "string" ? ref.guid : undefined;
+};
+
+/**
+ * Points a Ref value at its target's pack ID. A target outside the snapshot keeps only its path.
+ */
+function remapRef(value: unknown, refIds: Map<string, string>): unknown {
+  const guid = getRefGuid(value);
+  if (!guid) return value;
+
+  const { Ref, ...rest } = value as { Ref: Record<string, unknown> };
+  const { guid: _, ...ref } = Ref;
+  const refId = refIds.get(guid);
+  return { ...rest, Ref: refId ? { ...ref, guid: refId } : ref };
+}
+
+export function writePackedSourcemap(
+  sourcemap: SourcemapRoot,
+  outputPath: string,
+): void {
+  const dir = path.dirname(outputPath);
+  if (dir && dir !== "." && !fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
+
+  fs.writeFileSync(
+    outputPath,
+    `${JSON.stringify(sourcemap, null, 2)}\n`,
+    "utf8",
+  );
 }

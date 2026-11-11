@@ -36,6 +36,27 @@ export interface AzulConfig {
   /** Suffix ModuleScript names with ".module"? */
   suffixModuleScripts: boolean;
 
+  /** Rewrite `@self/` requires to `./instanceName/` when building or pushing */
+  rewriteSelfRequires: boolean;
+
+  /** Replicate filesystem actions (create, delete) to Studio during live sync */
+  liveFsSync: {
+    /** Replicate filesystem create/delete actions to Studio */
+    enabled: boolean;
+
+    /**
+     * Use polling for file watching instead of native OS events.
+     * On Windows, native watching holds open handles on every watched
+     * subdirectory, which makes the OS reject renaming any folder that
+     * contains a watched subfolder (EPERM). Polling avoids those handles.
+     * Defaults to true on Windows, false elsewhere.
+     */
+    usePolling: boolean;
+
+    /** Interval (ms) used when usePolling is enabled */
+    pollInterval: number;
+  };
+
   /** Check for Daemon updates? (Uses NPM API) */
   checkForUpdates: boolean;
 }
@@ -49,6 +70,12 @@ export const defaultConfig: Readonly<AzulConfig> = {
   fileWatchDebounce: 100,
   deleteOrphansOnConnect: true,
   suffixModuleScripts: false,
+  rewriteSelfRequires: false,
+  liveFsSync: {
+    enabled: true,
+    usePolling: process.platform === "win32",
+    pollInterval: 200,
+  },
   checkForUpdates: true,
 };
 
@@ -168,12 +195,27 @@ function sanitizeConfig(input: Record<string, unknown>): Partial<AzulConfig> {
     sanitized.fileWatchDebounce = input.fileWatchDebounce;
   }
 
+  if (isRecord(input.liveFsSync)) {
+    const fs = input.liveFsSync;
+    const liveFsSync = { ...defaultConfig.liveFsSync };
+    if (typeof fs.enabled === "boolean") liveFsSync.enabled = fs.enabled;
+    if (typeof fs.usePolling === "boolean")
+      liveFsSync.usePolling = fs.usePolling;
+    if (isPositiveInteger(fs.pollInterval))
+      liveFsSync.pollInterval = fs.pollInterval;
+    sanitized.liveFsSync = liveFsSync;
+  }
+
   if (typeof input.deleteOrphansOnConnect === "boolean") {
     sanitized.deleteOrphansOnConnect = input.deleteOrphansOnConnect;
   }
 
   if (typeof input.suffixModuleScripts === "boolean") {
     sanitized.suffixModuleScripts = input.suffixModuleScripts;
+  }
+
+  if (typeof input.rewriteSelfRequires === "boolean") {
+    sanitized.rewriteSelfRequires = input.rewriteSelfRequires;
   }
 
   if (typeof input.checkForUpdates === "boolean") {
