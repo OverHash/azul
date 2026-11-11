@@ -1,7 +1,13 @@
 local Enums = require("./Enums")
 
 configTable = {
-	WS_URL = "ws://localhost:8080",
+	WS_URL = "localhost:8080",
+
+	-- Auto-Reconnect Settings
+	MAX_HANDSHAKES = 5, -- Maximum handshake attempts per connection
+	MAX_RECONNECTIONS = -1, -- Maximum total reconnection attempts before giving up (-1 for infinite)
+	RECONNECTION_INTERVAL = 5,
+
 	HEARTBEAT_INTERVAL = 30,
 	BATCH_IDLE_WINDOW = 0.1,
 	SCRIPT_CHANGE_DEBOUNCE = 0.35,
@@ -24,8 +30,18 @@ configTable = {
 		"Workspace.Surface Converter Storage", -- Folder managed by "Surface Converter" plugin. We don't need to track it.
 	},
 
+	IGNORED_CLASSES = { -- ClassNames to ignore entirely (the instance and all of its descendants)
+		"KeyframeSequence", -- Keyframe Sequences are created by the Animation Editor. They are created in immense numbers and are not useful to track.
+	},
+
+	AUTO_CONNECT = false,
 	DEBUG_MODE = false,
 	SILENT_MODE = false,
+	NOTIFICATIONS = true,
+	NOTIFICATION_SOUNDS = true,
+	AUTO_OPEN_MODAL = true,
+	SYNC_REMINDERS = true, -- Remind to sync when opening a previously synced Place
+	STREAM_SOLO_OUTPUT = false,
 }
 
 return configTable

@@ -4,8 +4,10 @@ import { IPCServer } from "./ipc/server.js";
 import { config } from "./config.js";
 import { log } from "./util/log.js";
 import { SnapshotBuilder } from "./snapshot.js";
-import { RojoSnapshotBuilder } from "./snapshot/rojo.js";
+import { RojoSnapshotBuilder } from "./snapshot/rojo/index.js";
+import { findDefaultProjectFile } from "./rojoProject.js";
 import type { InstanceData } from "./ipc/messages.js";
+import { replaceSelfRequires } from "./util/scriptFile.js";
 import {
   applySourcemapProperties,
   buildInstancesFromSourcemap,
@@ -63,24 +65,39 @@ export class BuildCommand {
     if (this.rojoMode) {
       log.info(
         `Preparing Rojo compatibility build from ${
-          this.rojoProjectFile ?? "default.project.json"
+          this.rojoProjectFile ??
+          findDefaultProjectFile(process.cwd()) ??
+          "default.project.json"
         }`,
       );
     } else {
       log.info(`Preparing build snapshot from ${this.syncDir}`);
     }
     let instances: InstanceData[] = [];
+    let builtFromSourcemap = false; // Was the build done from the sourcemap (true) or from the filesystem (false)?
 
     if (!this.rojoMode && this.useSourcemapAsSource) {
       const built = buildInstancesFromSourcemap(this.sourcemapPath);
-      if (!built) {
+      // An empty array parses fine but contributes nothing, so treat it as a miss
+      if (!built || built.length === 0) {
         log.warn(
-          "Falling back to filesystem build because sourcemap import failed.",
+          "Falling back to filesystem build because the sourcemap was empty, missing, or could not be parsed.",
         );
       } else {
+        // Rewrite `@self` requires in the built instances to resolve against the instance name
+        for (const instance of built) {
+          if (instance.source) {
+            instance.source = replaceSelfRequires(
+              instance.name,
+              instance.source,
+            );
+          }
+        }
         instances = built;
       }
     }
+
+    builtFromSourcemap = instances.length > 0;
 
     if (instances.length === 0) {
       try {
@@ -91,10 +108,11 @@ export class BuildCommand {
       }
     }
 
+    // Apply properties from the sourcemap if requested, but only if the build was not done from the sourcemap (to avoid double-applying properties)
     if (
       !this.rojoMode &&
       this.applySourcemapProperties &&
-      !this.useSourcemapAsSource
+      !builtFromSourcemap
     ) {
       const index = loadSourcemapPropertyIndex(this.sourcemapPath);
       const applied = applySourcemapProperties(instances, index);
@@ -115,15 +133,19 @@ export class BuildCommand {
 
     await new Promise<void>((resolve) => {
       this.ipc.onConnection(() => {
-        log.info("Studio connected. Sending build snapshot...");
+        log.info("Studio connected. Waiting for handshake...");
+      });
+
+      this.ipc.onHandshake(() => {
+        log.info("Handshake complete. Sending build snapshot...");
         this.ipc.send({
           type: "buildSnapshot",
           data: instances,
           destructive: this.destructive,
         });
         log.success(`Sent ${instances.length} instances`);
-        setTimeout(() => {
-          this.ipc.close();
+        setTimeout(async () => {
+          await this.ipc.close();
           resolve();
         }, 200);
       });

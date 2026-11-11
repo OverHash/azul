@@ -2,19 +2,26 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { log } from "./util/log.js";
-import { classifyScriptFileName, isScriptFileName } from "./util/scriptFile.js";
+import {
+  classifyScriptFileName,
+  isScriptFileName,
+  replaceSelfRequires,
+} from "./util/scriptFile.js";
 import type { InstanceData } from "./ipc/messages.js";
 
 export interface SnapshotOptions {
   sourceDir: string;
   destPrefix?: string[];
   skipSymlinks?: boolean;
+  /** Absolute directory paths to leave out of the snapshot. */
+  skipDirs?: Set<string>;
 }
 
 export class SnapshotBuilder {
   private sourceDir: string;
   private destPrefix: string[];
   private skipSymlinks: boolean;
+  private skipDirs: Set<string>;
 
   private folderMap = new Map<string, InstanceData>();
   private results: InstanceData[] = [];
@@ -24,6 +31,9 @@ export class SnapshotBuilder {
     this.sourceDir = path.resolve(options.sourceDir);
     this.destPrefix = options.destPrefix ?? [];
     this.skipSymlinks = options.skipSymlinks !== false; // default: skip links
+    this.skipDirs = new Set(
+      [...(options.skipDirs ?? [])].map((dir) => path.resolve(dir)),
+    );
   }
 
   public async build(): Promise<InstanceData[]> {
@@ -68,7 +78,11 @@ export class SnapshotBuilder {
           ...dirSegments,
           scriptName,
         ];
-        const source = await fs.readFile(fullPath, "utf-8");
+        // Already Azul format on disk, so scriptName is the final instance name
+        const source = replaceSelfRequires(
+          scriptName,
+          await fs.readFile(fullPath, "utf-8"),
+        );
 
         this.scriptPaths.add(this.pathKey(filePathSegments));
 
@@ -78,6 +92,7 @@ export class SnapshotBuilder {
           name: scriptName,
           path: filePathSegments,
           source,
+          filePath: fullPath,
         };
 
         this.results.push(fileData);
@@ -93,6 +108,8 @@ export class SnapshotBuilder {
         log.debug(`Skipping symlinked directory during snapshot: ${fullPath}`);
         continue;
       }
+
+      if (this.skipDirs.has(fullPath)) continue;
 
       const relSegments = this.relativeSegments(fullPath);
       if (relSegments.length > 0) {

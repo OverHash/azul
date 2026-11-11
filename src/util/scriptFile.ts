@@ -1,3 +1,5 @@
+import { config } from "../config.js";
+
 export type ScriptClassName = "Script" | "LocalScript" | "ModuleScript";
 
 export interface ClassifiedScriptFile {
@@ -23,12 +25,58 @@ export function isScriptFileName(fileName: string): boolean {
   return fileName.endsWith(".lua") || fileName.endsWith(".luau");
 }
 
+/**
+ * Detects Rojo/Argon-style init files (`init.luau`, `init.server.luau`,
+ * `init.client.luau`, `init.module.luau`, and their `.lua` equivalents).
+ * The fork supports these when folderBackedScriptsWithChildren is enabled.
+ */
+export function isInitScriptFileName(fileName: string): boolean {
+  const normalized = normalizeLuaLikeFileName(fileName).toLowerCase();
+  return (
+    normalized === "init.luau" ||
+    normalized === "init.server.luau" ||
+    normalized === "init.client.luau" ||
+    normalized === "init.module.luau"
+  );
+}
+
+export function isInstanceJsonName(fileName: string): boolean {
+  return fileName.endsWith(".model.json");
+  // || fileName.endsWith(".meta.json"); // No support for this yet
+}
+
 export function normalizeLuaLikeFileName(fileName: string): string {
   return fileName.replace(/\.lua$/i, ".luau");
 }
 
 export function stripScriptDisambiguationSuffix(scriptName: string): string {
   return scriptName.replace(/__\{?[a-z0-9-]{6,}\}?$/i, "");
+}
+
+/**
+ * Replaces `@self` with `./instanceName/` when `config.rewriteSelfRequires` is enabled.
+ *
+ * @param instanceName The name of the instance that the source belongs to.
+ * @param source The source code to rewrite.
+ * @returns The rewritten source code.
+ */
+export function replaceSelfRequires(
+  instanceName: string,
+  source: string,
+): string {
+  /**
+   * Azul's peer pattern is not considered "submodules" by the Luau standard,
+   * therefore `@self` resolution will fail when using tools like Luau-LSP,
+   * which make the "correct" assumption that `@self` must represent the
+   * folder above it!
+   *
+   * Replacing `@self` with `./instanceName/` keeps local tooling happy when
+   * using external code that relies on the `@self` syntax.
+   */
+  if (!config.rewriteSelfRequires) {
+    return source;
+  }
+  return source.replace(/@self\//g, `./${instanceName}/`);
 }
 
 export function classifyScriptFileName(
