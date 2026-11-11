@@ -52,8 +52,7 @@ export class SyncDaemon {
   private readonly userDebugMode = config.debugMode;
   // Receives the next fullSnapshot instead of live sync while packing, or null if Studio disconnects first
   private packSnapshotHandler:
-    | ((message: FullSnapshotMessage | null) => void)
-    | null = null;
+    ((message: FullSnapshotMessage | null) => void) | null = null;
   private packOnExitPromise: Promise<void> | null = null;
 
   // Buffers a deletion briefly so a matching filesystem creation can become a
@@ -66,6 +65,7 @@ export class SyncDaemon {
     { guid: string; oldSegments: string[]; timer: NodeJS.Timeout }
   >();
   private guidToInode = new Map<string, string>();
+  private guidToDirectoryInode = new Map<string, string>();
   private readonly moveWindowMs = Math.max(500, config.fileWatchDebounce * 5);
 
   constructor() {
@@ -275,6 +275,7 @@ export class SyncDaemon {
    * Handle instance update (rename, move, etc.)
    */
   private handleInstanceUpdated(data: any): void {
+    const previousParent = this.tree.getNode(data.guid)?.parent;
     const update = this.tree.updateInstance(data);
     const node = update?.node;
 
@@ -283,6 +284,15 @@ export class SyncDaemon {
     }
 
     const scriptsToUpdate: Map<string, TreeNode> = new Map();
+
+    const addLayoutParent = (parent: TreeNode | undefined): void => {
+      if (!config.folderBackedScriptsWithChildren) return;
+      for (let ancestor = parent; ancestor; ancestor = ancestor.parent) {
+        if (this.isScriptClass(ancestor.className)) {
+          scriptsToUpdate.set(ancestor.guid, ancestor);
+        }
+      }
+    };
 
     if (this.isScriptClass(node.className)) {
       scriptsToUpdate.set(node.guid, node);
@@ -294,10 +304,20 @@ export class SyncDaemon {
       }
     }
 
-    for (const scriptNode of scriptsToUpdate.values()) {
+    if (update.isNew || update.parentChanged) {
+      addLayoutParent(previousParent);
+      addLayoutParent(node.parent);
+    }
+
+    const sortedScriptsToUpdate = [...scriptsToUpdate.values()].sort(
+      (a, b) => a.path.length - b.path.length,
+    );
+
+    for (const scriptNode of sortedScriptsToUpdate) {
       const filePath = this.fileWriter.getFilePath(scriptNode);
       this.fileWatcher.suppressNextChange(filePath, scriptNode.source);
       this.fileWriter.writeScript(scriptNode);
+      this.recordInode(scriptNode);
     }
 
     const shouldUpdateSourcemap =
@@ -333,6 +353,13 @@ export class SyncDaemon {
       this.scheduleCleanup();
       return;
     }
+
+    const layoutParentToUpdate =
+      config.folderBackedScriptsWithChildren &&
+      node.parent &&
+      this.isScriptClass(node.parent.className)
+        ? node.parent
+        : undefined;
 
     // Capture all script descendants (and the node itself if script) before we delete the tree nodes
     const scriptsToDelete: { guid: string; filePath: string | null }[] = [];
@@ -383,6 +410,16 @@ export class SyncDaemon {
           this.fileWriter.writeScript(scriptToRename);
         }
       }
+    }
+
+    if (layoutParentToUpdate) {
+      const filePath = this.fileWriter.getFilePath(layoutParentToUpdate);
+      this.fileWatcher.suppressNextChange(
+        filePath,
+        layoutParentToUpdate.source,
+      );
+      this.fileWriter.writeScript(layoutParentToUpdate);
+      this.recordInode(layoutParentToUpdate);
     }
 
     this.scheduleCleanup();
@@ -477,6 +514,26 @@ export class SyncDaemon {
     return rel.split(/[/\\]/).filter(Boolean);
   }
 
+  /** Init files represent their containing instance, never a child named init. */
+  private getScriptInstanceSegments(filePath: string): string[] {
+    const segments = this.getRelativeSegments(filePath);
+    const fileName = segments.pop();
+    if (!fileName) return [];
+    if (
+      config.folderBackedScriptsWithChildren &&
+      isInitScriptFileName(fileName)
+    ) {
+      // A root-level init has no containing instance inside syncDir.
+      return segments.length > 1 ? segments : [];
+    }
+    return [
+      ...segments,
+      classifyScriptFileName(fileName, {
+        stripDisambiguationSuffix: true,
+      }).scriptName,
+    ];
+  }
+
   /**
    * Handle new file creation on filesystem
    */
@@ -494,6 +551,8 @@ export class SyncDaemon {
 
     const dirSegments = segments.slice(0, -1);
     const fileName = segments[segments.length - 1];
+    const instanceSegments = this.getScriptInstanceSegments(filePath);
+    if (instanceSegments.length === 0) return;
 
     // A file creation may actually be the destination of a script rename/move.
     // The inode is preserved across a rename, so if this new file's inode
@@ -509,7 +568,7 @@ export class SyncDaemon {
       this.performInstanceMove(
         pending.guid,
         pending.oldSegments,
-        [...dirSegments, classified.scriptName],
+        instanceSegments,
         classified.className,
         source,
       );
@@ -517,7 +576,10 @@ export class SyncDaemon {
     }
 
     // Rojo developers may do init.luau; warn them about Azul's behavior!
-    if (isInitScriptFileName(fileName)) {
+    if (
+      !config.folderBackedScriptsWithChildren &&
+      isInitScriptFileName(fileName)
+    ) {
       const relPath = path.relative(this.fileWriter.getBaseDir(), filePath);
       const normalized = normalizeLuaLikeFileName(fileName).toLowerCase();
 
@@ -558,8 +620,8 @@ export class SyncDaemon {
 
     this.ipc.createInstance(
       classified.className,
-      classified.scriptName,
-      dirSegments,
+      instanceSegments[instanceSegments.length - 1],
+      instanceSegments.slice(0, -1),
       source,
     );
   }
@@ -612,14 +674,9 @@ export class SyncDaemon {
       const segments = this.getRelativeSegments(filePath);
       if (segments.length === 0) return;
 
-      const dirSegments = segments.slice(0, -1);
-      const fileName = segments[segments.length - 1];
-      const classified = classifyScriptFileName(fileName, {
-        stripDisambiguationSuffix: true,
-      });
-      const instancePath = [...dirSegments, classified.scriptName];
-
-      this.ipc.deleteInstance(undefined, instancePath);
+      const instancePath = this.getScriptInstanceSegments(filePath);
+      if (instancePath.length > 0)
+        this.ipc.deleteInstance(undefined, instancePath);
     }
   }
 
@@ -629,6 +686,16 @@ export class SyncDaemon {
    * `Foo.server.luau` + `Foo/`). Such directories must not map to Folder instances.
    */
   private isScriptChildContainer(dirPath: string): boolean {
+    if (config.folderBackedScriptsWithChildren && fs.existsSync(dirPath)) {
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      if (
+        entries.some(
+          (entry) => entry.isFile() && isInitScriptFileName(entry.name),
+        )
+      ) {
+        return true;
+      }
+    }
     const parentDir = path.dirname(dirPath);
     const folderName = path.basename(dirPath);
 
@@ -664,6 +731,14 @@ export class SyncDaemon {
     const parentPath = segments.slice(0, -1);
     const folderName = segments[segments.length - 1];
 
+    // A folder-backed script moves with its directory, including its init file.
+    const inode = this.statInode(dirPath);
+    const pending = inode ? this.pendingInstanceDeletes.get(inode) : undefined;
+    if (pending) {
+      this.performInstanceMove(pending.guid, pending.oldSegments, segments);
+      return;
+    }
+
     // A directory alongside a same-named script is that script's children
     // container, not a Folder instance. Creating a Folder here would spawn a
     // spurious duplicate of the script's name in Studio.
@@ -679,13 +754,6 @@ export class SyncDaemon {
     // directory's inode matches a buffered folder deletion, move the existing
     // instance instead of creating a fresh Folder — this preserves non-script
     // descendants that have no filesystem representation.
-    const inode = this.statInode(dirPath);
-    const pending = inode ? this.pendingInstanceDeletes.get(inode) : undefined;
-    if (pending) {
-      this.performInstanceMove(pending.guid, pending.oldSegments, segments);
-      return;
-    }
-
     log.debug(
       `Directory created: ${path.relative(this.fileWriter.getBaseDir(), dirPath)} (external)`,
     );
@@ -712,7 +780,18 @@ export class SyncDaemon {
       return;
     }
 
-    const node = this.findTrackedFolderNode(segments);
+    const trackedNode = this.findTrackedNode(segments);
+    const folderBackedScript =
+      trackedNode &&
+      config.folderBackedScriptsWithChildren &&
+      isInitScriptFileName(
+        path.basename(
+          this.fileWriter.getMapping(trackedNode.guid)?.filePath ?? "",
+        ),
+      );
+    const node = folderBackedScript
+      ? trackedNode
+      : this.findTrackedFolderNode(segments);
     if (!node) {
       // Untracked folder (created and removed purely on disk): nothing in Studio
       // to lose, delete immediately.
@@ -728,7 +807,10 @@ export class SyncDaemon {
     // cascades and destroys non-script descendants that can't be rebuilt from disk.
     // Key by the folder's inode (recorded while its directory still existed) so a
     // matching addDir can claim it regardless of per-file event ordering.
-    const key = this.guidToInode.get(node.guid) ?? `guid:${node.guid}`;
+    const key =
+      (folderBackedScript
+        ? this.guidToDirectoryInode.get(node.guid)
+        : this.guidToInode.get(node.guid)) ?? `guid:${node.guid}`;
     const previous = this.pendingInstanceDeletes.get(key);
     if (previous) {
       clearTimeout(previous.timer);
@@ -820,6 +902,16 @@ export class SyncDaemon {
     }
     const inode = this.statInode(this.fileWriter.getFilePath(node));
     if (inode) this.guidToInode.set(node.guid, inode);
+    if (
+      config.folderBackedScriptsWithChildren &&
+      this.isScriptClass(node.className)
+    ) {
+      const directoryInode = this.statInode(
+        this.fileWriter.getDirPathForSegments(node.path),
+      );
+      if (directoryInode)
+        this.guidToDirectoryInode.set(node.guid, directoryInode);
+    }
   }
 
   /** Record inodes for every tracked node that has a file/directory on disk. */
@@ -842,6 +934,25 @@ export class SyncDaemon {
     // a rename/move handled elsewhere — never delete an instance that relocated.
     const node = this.tree.getNode(guid);
     if (node && !this.pathsEqualSegments(node.path, oldSegments)) return;
+
+    const mapping = this.fileWriter.getMapping(guid);
+    if (
+      node &&
+      config.folderBackedScriptsWithChildren &&
+      mapping &&
+      isInitScriptFileName(path.basename(mapping.filePath)) &&
+      fs.existsSync(path.dirname(mapping.filePath))
+    ) {
+      // Atomic editor saves may replace init with a new inode before the
+      // buffered unlink expires. That is a content edit, not a demotion.
+      if (fs.existsSync(mapping.filePath)) return;
+      // Removing only init demotes the containing script to a Folder. Do not
+      // Destroy() its children (including Parts that have no file on disk).
+      if (this.performInstanceMove(guid, oldSegments, oldSegments, "Folder")) {
+        this.fileWriter.deleteScript(guid);
+      }
+      return;
+    }
 
     this.guidToInode.delete(guid);
     log.debug(`Deleted instance: ${oldSegments.join("/")} (external)`);
@@ -869,7 +980,7 @@ export class SyncDaemon {
     newSegments: string[],
     newClassName?: string,
     source?: string,
-  ): void {
+  ): boolean {
     const newName = newSegments[newSegments.length - 1];
     const node = this.tree.getNode(guid);
 
@@ -883,13 +994,14 @@ export class SyncDaemon {
 
     // Move (and, if needed, convert) the existing instance in Studio,
     // preserving its GUID and every descendant (scripts and non-scripts alike).
-    this.ipc.moveInstance(
+    const sent = this.ipc.moveInstance(
       guid,
       newSegments.slice(0, -1),
       newName,
       classChanged ? newClassName : undefined,
       classChanged ? source : undefined,
     );
+    if (!sent) return false;
 
     // Resolve the destination parent from the NEW location. Without an explicit
     // parentGuid, updateInstance treats the parent as unchanged and leaves the
@@ -962,6 +1074,10 @@ export class SyncDaemon {
     }
 
     if (moved) {
+      this.recordInode(moved);
+      for (const descendant of this.tree.getDescendantScripts(guid)) {
+        this.recordInode(descendant);
+      }
       this.scheduleSourcemapWrite();
     }
     this.scheduleCleanup();
@@ -978,6 +1094,7 @@ export class SyncDaemon {
       `${action} (${moved?.className ?? "?"}): ${oldSegments.join("/")} -> ${newSegments.join("/")} (external)`,
       "updated",
     );
+    return true;
   }
 
   /**
@@ -995,9 +1112,12 @@ export class SyncDaemon {
     const oldFolderPath = this.fileWriter.getDirPathForSegments(oldSegments);
     const newFolderPath = this.fileWriter.getDirPathForSegments(newSegments);
 
-    if (oldFolderPath === newFolderPath || !fs.existsSync(oldFolderPath)) {
+    if (oldFolderPath === newFolderPath) {
       return;
     }
+    const alreadyMoved =
+      !fs.existsSync(oldFolderPath) && fs.existsSync(newFolderPath);
+    if (!alreadyMoved && !fs.existsSync(oldFolderPath)) return;
 
     // Snapshot descendants' current file paths before anything moves.
     // FileWriter's mapping table is independent of tree.path (already updated
@@ -1015,15 +1135,17 @@ export class SyncDaemon {
     this.fileWatcher.suppressNextEvent(oldFolderPath, "unlinkDir");
     this.fileWatcher.suppressNextEvent(newFolderPath, "addDir");
 
-    try {
-      fs.mkdirSync(path.dirname(newFolderPath), { recursive: true });
-      fs.renameSync(oldFolderPath, newFolderPath);
-    } catch (error) {
-      log.warn(
-        `Failed to relocate children folder for moved instance ${guid} (left at old location):`,
-        error,
-      );
-      return;
+    if (!alreadyMoved) {
+      try {
+        fs.mkdirSync(path.dirname(newFolderPath), { recursive: true });
+        fs.renameSync(oldFolderPath, newFolderPath);
+      } catch (error) {
+        log.warn(
+          `Failed to relocate children folder for moved instance ${guid} (left at old location):`,
+          error,
+        );
+        return;
+      }
     }
 
     for (const descendant of descendants) {
@@ -1176,7 +1298,8 @@ export class SyncDaemon {
     // Live sync has already written every script, so reuse its file mappings
     const { sourcemap, packedCount } = buildPackedSourcemap(snapshot.data, {
       placeId: snapshot.placeId,
-      resolveScriptPath: (item) => this.fileWriter.getMapping(item.guid)?.filePath,
+      resolveScriptPath: (item) =>
+        this.fileWriter.getMapping(item.guid)?.filePath,
     });
     try {
       writePackedSourcemap(sourcemap, outputPath);
@@ -1208,6 +1331,7 @@ export class SyncDaemon {
         this.cleanupDirectories();
       }
       this.guidToInode.clear();
+      this.guidToDirectoryInode.clear();
       await this.fileWatcher.stop();
       this.ipc.send({ type: "daemonDisconnect" });
       await new Promise((resolve) => setTimeout(resolve, 50));

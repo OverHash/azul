@@ -8,6 +8,267 @@ import { SyncDaemon } from "../index.js";
 import { config } from "../config.js";
 import { isVersionCompatible } from "../util/versionUtils.js";
 
+// Fork regressions run against synthetic Studio messages on an ephemeral port;
+// they never connect to Studio or touch a consumer project's files/config.
+async function withFolderBackedDaemon(
+  run: (daemon: any, tmp: string, sent: any[]) => Promise<void>,
+) {
+  const tmp = makeTempDir("azul-folder-backed-");
+  const previous = { ...config };
+  let daemon: SyncDaemon | undefined;
+  try {
+    Object.assign(config, {
+      syncDir: tmp,
+      sourcemapPath: path.join(tmp, "sourcemap.json"),
+      port: 0,
+      folderBackedScriptsWithChildren: true,
+      liveFsSync: { ...config.liveFsSync, enabled: true },
+    });
+    daemon = new SyncDaemon();
+    const sent: any[] = [];
+    (daemon as any).ipc.send = (message: any) => {
+      sent.push(message);
+      return true;
+    };
+    await run(daemon, tmp, sent);
+  } finally {
+    await daemon?.stop();
+    Object.assign(config, previous);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+function folderBackedSnapshot(daemon: any, className = "ModuleScript") {
+  daemon.tree.applyFullSnapshot([
+    {
+      guid: "rs",
+      className: "ReplicatedStorage",
+      name: "ReplicatedStorage",
+      path: ["ReplicatedStorage"],
+    },
+    {
+      guid: "parent",
+      className,
+      name: "Parent",
+      path: ["ReplicatedStorage", "Parent"],
+      parentGuid: "rs",
+      source: "return {}",
+    },
+    {
+      guid: "child",
+      className: "ModuleScript",
+      name: "Child",
+      path: ["ReplicatedStorage", "Parent", "Child"],
+      parentGuid: "parent",
+      source: "return 1",
+    },
+    {
+      guid: "part",
+      className: "Part",
+      name: "Part",
+      path: ["ReplicatedStorage", "Parent", "Part"],
+      parentGuid: "parent",
+    },
+  ]);
+  daemon.fileWriter.writeTree(daemon.tree.getAllNodes());
+  daemon.recordInodes();
+  daemon.regenerateSourcemap();
+}
+
+test("folder-backed export supports all script classes, suffixes and Lua extensions", async () => {
+  await withFolderBackedDaemon(async (daemon, tmp) => {
+    for (const extension of [".luau", ".lua"]) {
+      config.scriptExtension = extension;
+      for (const [className, suffix, moduleSuffix] of [
+        ["ModuleScript", "", false],
+        ["ModuleScript", ".module", true],
+        ["Script", ".server", false],
+        ["LocalScript", ".client", false],
+      ] as const) {
+        config.suffixModuleScripts = moduleSuffix;
+        folderBackedSnapshot(daemon, className);
+        const initPath = path.join(
+          tmp,
+          "ReplicatedStorage",
+          "Parent",
+          `init${suffix}${extension}`,
+        );
+        assert.equal(daemon.fileWriter.getMapping("parent").filePath, initPath);
+        assert.equal(fs.readFileSync(initPath, "utf8"), "return {}");
+        assert.equal(daemon.fileWriter.getGuidByPath(initPath), "parent");
+        const entry = findInSourcemap(readSourcemap(), [
+          "ReplicatedStorage",
+          "Parent",
+        ]);
+        assert.equal(entry.className, className);
+        assert.ok(
+          entry.filePaths.some((p: string) =>
+            p.endsWith(`init${suffix}${extension}`),
+          ),
+        );
+      }
+    }
+  });
+});
+
+test("folder-backed layout updates script ancestors through non-script containers", async () => {
+  await withFolderBackedDaemon(async (daemon, tmp, sent) => {
+    folderBackedSnapshot(daemon);
+    daemon.handleDeleted({ guid: "child" });
+    const parentDir = path.join(tmp, "ReplicatedStorage", "Parent");
+    // Explicit init layout remains stable when the last script child is removed.
+    assert.ok(fs.existsSync(path.join(parentDir, "init.luau")));
+    daemon.handleInstanceUpdated({
+      guid: "container",
+      className: "Folder",
+      name: "Container",
+      path: ["ReplicatedStorage", "Parent", "Container"],
+      parentGuid: "parent",
+    });
+    daemon.handleInstanceUpdated({
+      guid: "nested",
+      className: "ModuleScript",
+      name: "Nested",
+      path: ["ReplicatedStorage", "Parent", "Container", "Nested"],
+      parentGuid: "container",
+      source: "return 2",
+    });
+    assert.ok(fs.existsSync(path.join(parentDir, "Container", "Nested.luau")));
+    daemon.handleFileChange(path.join(parentDir, "init.luau"), "return 3");
+    assert.ok(
+      sent.some(
+        (m) =>
+          m.type === "patchScript" &&
+          m.guid === "parent" &&
+          m.source === "return 3",
+      ),
+    );
+    await readSettledSourcemap();
+    assert.equal(
+      findInSourcemap(readSourcemap(), ["ReplicatedStorage", "Parent"])
+        .className,
+      "ModuleScript",
+    );
+  });
+});
+
+test("new init files target the containing instance and do not create an init child or duplicate Folder", async () => {
+  await withFolderBackedDaemon(async (daemon, tmp, sent) => {
+    for (const [fileName, className] of [
+      ["init.luau", "ModuleScript"],
+      ["init.module.lua", "ModuleScript"],
+      ["init.server.luau", "Script"],
+      ["init.client.lua", "LocalScript"],
+    ]) {
+      const dir = path.join(tmp, "ReplicatedStorage", className + fileName);
+      fs.mkdirSync(dir, { recursive: true });
+      const init = path.join(dir, fileName);
+      fs.writeFileSync(init, "return {}");
+      sent.length = 0;
+      daemon.handleDirAdd(dir);
+      daemon.handleFileAdd(init, "return {}");
+      assert.deepEqual(sent, [
+        {
+          type: "createInstance",
+          className,
+          name: path.basename(dir),
+          parentPath: ["ReplicatedStorage"],
+          source: "return {}",
+        },
+      ]);
+    }
+    sent.length = 0;
+    daemon.handleFileAdd(path.join(tmp, "init.luau"), "return {}");
+    assert.equal(
+      sent.length,
+      0,
+      "root init must not create or replace a service",
+    );
+  });
+});
+
+for (const fileFirst of [false, true]) {
+  test(`folder-backed directory move preserves GUIDs, Parts, mappings and edits (${fileFirst ? "file" : "directory"} add first)`, async () => {
+    await withFolderBackedDaemon(async (daemon, tmp, sent) => {
+      folderBackedSnapshot(daemon);
+      const oldDir = path.join(tmp, "ReplicatedStorage", "Parent");
+      const newDir = path.join(tmp, "ReplicatedStorage", "Renamed");
+      const oldInit = path.join(oldDir, "init.luau");
+      fs.renameSync(oldDir, newDir);
+      daemon.handleFileDelete(path.join(oldDir, "Child.luau"));
+      daemon.handleFileDelete(oldInit);
+      daemon.handleDirDelete(oldDir);
+      if (fileFirst)
+        daemon.handleFileAdd(path.join(newDir, "init.luau"), "return {}");
+      daemon.handleDirAdd(newDir);
+      if (!fileFirst)
+        daemon.handleFileAdd(path.join(newDir, "init.luau"), "return {}");
+      assert.equal(sent.filter((m) => m.type === "moveInstance").length, 1);
+      assert.equal(sent.filter((m) => m.type === "createInstance").length, 0);
+      assert.deepEqual(daemon.tree.getNode("part").path, [
+        "ReplicatedStorage",
+        "Renamed",
+        "Part",
+      ]);
+      assert.equal(
+        daemon.fileWriter.getMapping("parent").filePath,
+        path.join(newDir, "init.luau"),
+      );
+      const childPath = path.join(newDir, "Child.luau");
+      assert.equal(daemon.fileWriter.getGuidByPath(childPath), "child");
+      daemon.handleFileChange(childPath, "return 4");
+      assert.ok(
+        sent.some((m) => m.type === "patchScript" && m.guid === "child"),
+      );
+      await wait(650);
+      assert.equal(sent.filter((m) => m.type === "deleteInstance").length, 0);
+      assert.ok(daemon.tree.getNode("part"));
+    });
+  });
+}
+
+test("renaming an init suffix changes class without moving to an init child", async () => {
+  await withFolderBackedDaemon(async (daemon, tmp, sent) => {
+    folderBackedSnapshot(daemon);
+    const dir = path.join(tmp, "ReplicatedStorage", "Parent");
+    const oldInit = path.join(dir, "init.luau");
+    const newInit = path.join(dir, "init.server.luau");
+    fs.renameSync(oldInit, newInit);
+    daemon.handleFileDelete(oldInit);
+    daemon.handleFileAdd(newInit, "print(1)");
+    const move = sent.find((m) => m.type === "moveInstance");
+    assert.equal(move.guid, "parent");
+    assert.equal(move.name, "Parent");
+    assert.equal(move.className, "Script");
+    assert.deepEqual(move.parentPath, ["ReplicatedStorage"]);
+    assert.equal(daemon.fileWriter.getGuidByPath(newInit), "parent");
+    assert.ok(daemon.tree.getNode("part"));
+  });
+});
+
+test("removing only init demotes to Folder without destroying descendants", async () => {
+  await withFolderBackedDaemon(async (daemon, tmp, sent) => {
+    folderBackedSnapshot(daemon);
+    const init = path.join(tmp, "ReplicatedStorage", "Parent", "init.luau");
+    fs.unlinkSync(init);
+    daemon.handleFileDelete(init);
+    await wait(650);
+    assert.equal(sent.filter((m) => m.type === "deleteInstance").length, 0);
+    assert.ok(
+      sent.some(
+        (m) =>
+          m.type === "moveInstance" &&
+          m.guid === "parent" &&
+          m.className === "Folder",
+      ),
+    );
+    assert.equal(daemon.tree.getNode("parent").className, "Folder");
+    assert.ok(daemon.tree.getNode("part"));
+    assert.ok(daemon.tree.getNode("child"));
+    assert.equal(daemon.fileWriter.getMapping("parent"), undefined);
+  });
+});
+
 function makeTempDir(prefix = "azul-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -596,8 +857,21 @@ test("renaming a script's suffix propagates the class change (ModuleScript -> Sc
     const tree = (daemon as any).tree;
 
     tree.applyFullSnapshot([
-      { guid: "rs", className: "ReplicatedStorage", name: "ReplicatedStorage", path: ["ReplicatedStorage"], parentGuid: "root" },
-      { guid: "gM", className: "ModuleScript", name: "Foo", path: ["ReplicatedStorage", "Foo"], parentGuid: "rs", source: "return {}" },
+      {
+        guid: "rs",
+        className: "ReplicatedStorage",
+        name: "ReplicatedStorage",
+        path: ["ReplicatedStorage"],
+        parentGuid: "root",
+      },
+      {
+        guid: "gM",
+        className: "ModuleScript",
+        name: "Foo",
+        path: ["ReplicatedStorage", "Foo"],
+        parentGuid: "rs",
+        source: "return {}",
+      },
     ]);
 
     (daemon as any).fileWriter.writeTree(tree.getAllNodes());
@@ -616,14 +890,25 @@ test("renaming a script's suffix propagates the class change (ModuleScript -> Sc
     fs.renameSync(oldScript, newScript);
 
     (daemon as any).handleFileDelete(oldScript);
-    (daemon as any).handleFileAdd(newScript, fs.readFileSync(newScript, "utf8"));
+    (daemon as any).handleFileAdd(
+      newScript,
+      fs.readFileSync(newScript, "utf8"),
+    );
 
     const moves = sentMessages.filter((m) => m.type === "moveInstance");
     assert.strictEqual(moves.length, 1);
-    assert.strictEqual(moves[0].className, "Script", "class change is sent to Studio");
+    assert.strictEqual(
+      moves[0].className,
+      "Script",
+      "class change is sent to Studio",
+    );
 
     const node = tree.getNode("gM");
-    assert.strictEqual(node.className, "Script", "daemon tree reflects the new class");
+    assert.strictEqual(
+      node.className,
+      "Script",
+      "daemon tree reflects the new class",
+    );
 
     // FileWriter's mapping matches the actual renamed file, not the old path.
     const mapping = (daemon as any).fileWriter.getMapping("gM");
@@ -639,7 +924,11 @@ test("renaming a script's suffix propagates the class change (ModuleScript -> Sc
     const deletes = sentMessages.filter(
       (m) => m.type === "deleteInstance" && m.guid === "gM",
     );
-    assert.strictEqual(deletes.length, 0, "no delayed delete for the renamed instance");
+    assert.strictEqual(
+      deletes.length,
+      0,
+      "no delayed delete for the renamed instance",
+    );
   } finally {
     await daemon?.stop();
     config.syncDir = prevSyncDir;
@@ -668,8 +957,21 @@ test("renaming a script's suffix propagates the class change (Script -> ModuleSc
     const tree = (daemon as any).tree;
 
     tree.applyFullSnapshot([
-      { guid: "rs", className: "ReplicatedStorage", name: "ReplicatedStorage", path: ["ReplicatedStorage"], parentGuid: "root" },
-      { guid: "gS", className: "Script", name: "Foo", path: ["ReplicatedStorage", "Foo"], parentGuid: "rs", source: "print(1)" },
+      {
+        guid: "rs",
+        className: "ReplicatedStorage",
+        name: "ReplicatedStorage",
+        path: ["ReplicatedStorage"],
+        parentGuid: "root",
+      },
+      {
+        guid: "gS",
+        className: "Script",
+        name: "Foo",
+        path: ["ReplicatedStorage", "Foo"],
+        parentGuid: "rs",
+        source: "print(1)",
+      },
     ]);
 
     (daemon as any).fileWriter.writeTree(tree.getAllNodes());
@@ -687,20 +989,35 @@ test("renaming a script's suffix propagates the class change (Script -> ModuleSc
     fs.renameSync(oldScript, newScript);
 
     (daemon as any).handleFileDelete(oldScript);
-    (daemon as any).handleFileAdd(newScript, fs.readFileSync(newScript, "utf8"));
+    (daemon as any).handleFileAdd(
+      newScript,
+      fs.readFileSync(newScript, "utf8"),
+    );
 
     const moves = sentMessages.filter((m) => m.type === "moveInstance");
     assert.strictEqual(moves.length, 1);
-    assert.strictEqual(moves[0].className, "ModuleScript", "class change is sent to Studio");
+    assert.strictEqual(
+      moves[0].className,
+      "ModuleScript",
+      "class change is sent to Studio",
+    );
 
     const node = tree.getNode("gS");
-    assert.strictEqual(node.className, "ModuleScript", "daemon tree reflects the new class");
+    assert.strictEqual(
+      node.className,
+      "ModuleScript",
+      "daemon tree reflects the new class",
+    );
 
     await wait(650);
     const deletes = sentMessages.filter(
       (m) => m.type === "deleteInstance" && m.guid === "gS",
     );
-    assert.strictEqual(deletes.length, 0, "no delayed delete for the renamed instance");
+    assert.strictEqual(
+      deletes.length,
+      0,
+      "no delayed delete for the renamed instance",
+    );
   } finally {
     await daemon?.stop();
     config.syncDir = prevSyncDir;
@@ -927,10 +1244,37 @@ test("moving a script to become nested under another script resolves the correct
     // destinationParent must resolve Other even though it's a script, not a folder.
     const tree = (daemon as any).tree;
     tree.applyFullSnapshot([
-      { guid: "rs", className: "ReplicatedStorage", name: "ReplicatedStorage", path: ["ReplicatedStorage"], parentGuid: "root" },
-      { guid: "gM", className: "ModuleScript", name: "Module", path: ["ReplicatedStorage", "Module"], parentGuid: "rs", source: "return {}" },
-      { guid: "gSub", className: "Script", name: "Sub", path: ["ReplicatedStorage", "Module", "Sub"], parentGuid: "gM", source: "print(1)" },
-      { guid: "gOther", className: "ModuleScript", name: "Other", path: ["ReplicatedStorage", "Other"], parentGuid: "rs", source: "return {}" },
+      {
+        guid: "rs",
+        className: "ReplicatedStorage",
+        name: "ReplicatedStorage",
+        path: ["ReplicatedStorage"],
+        parentGuid: "root",
+      },
+      {
+        guid: "gM",
+        className: "ModuleScript",
+        name: "Module",
+        path: ["ReplicatedStorage", "Module"],
+        parentGuid: "rs",
+        source: "return {}",
+      },
+      {
+        guid: "gSub",
+        className: "Script",
+        name: "Sub",
+        path: ["ReplicatedStorage", "Module", "Sub"],
+        parentGuid: "gM",
+        source: "print(1)",
+      },
+      {
+        guid: "gOther",
+        className: "ModuleScript",
+        name: "Other",
+        path: ["ReplicatedStorage", "Other"],
+        parentGuid: "rs",
+        source: "return {}",
+      },
     ]);
 
     (daemon as any).ipc.send = () => true;

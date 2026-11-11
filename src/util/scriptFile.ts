@@ -27,15 +27,16 @@ export function isScriptFileName(fileName: string): boolean {
 
 /**
  * Detects Rojo/Argon-style init files (`init.luau`, `init.server.luau`,
- * `init.client.luau`, and their `.lua` equivalents). Azul does not use the
- * init pattern — it uses a script file plus a same-named sibling folder.
+ * `init.client.luau`, `init.module.luau`, and their `.lua` equivalents).
+ * The fork supports these when folderBackedScriptsWithChildren is enabled.
  */
 export function isInitScriptFileName(fileName: string): boolean {
   const normalized = normalizeLuaLikeFileName(fileName).toLowerCase();
   return (
     normalized === "init.luau" ||
     normalized === "init.server.luau" ||
-    normalized === "init.client.luau"
+    normalized === "init.client.luau" ||
+    normalized === "init.module.luau"
   );
 }
 

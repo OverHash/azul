@@ -56,6 +56,8 @@ export interface AzulConfig {
     /** Interval (ms) used when usePolling is enabled */
     pollInterval: number;
   };
+  /** Export scripts with children as folder-backed init files? */
+  folderBackedScriptsWithChildren: boolean;
 
   /** Check for Daemon updates? (Uses NPM API) */
   checkForUpdates: boolean;
@@ -76,6 +78,7 @@ export const defaultConfig: Readonly<AzulConfig> = {
     usePolling: process.platform === "win32",
     pollInterval: 200,
   },
+  folderBackedScriptsWithChildren: false,
   checkForUpdates: true,
 };
 
@@ -216,6 +219,11 @@ function sanitizeConfig(input: Record<string, unknown>): Partial<AzulConfig> {
 
   if (typeof input.rewriteSelfRequires === "boolean") {
     sanitized.rewriteSelfRequires = input.rewriteSelfRequires;
+  }
+
+  if (typeof input.folderBackedScriptsWithChildren === "boolean") {
+    sanitized.folderBackedScriptsWithChildren =
+      input.folderBackedScriptsWithChildren;
   }
 
   if (typeof input.checkForUpdates === "boolean") {
