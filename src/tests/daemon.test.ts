@@ -297,6 +297,108 @@ async function readSettledSourcemap(): Promise<any> {
   return readSourcemap();
 }
 
+test("atomic init replacement is an edit, not a delayed Folder demotion", async () => {
+  await withFolderBackedDaemon(async (daemon, tmp, sent) => {
+    folderBackedSnapshot(daemon);
+    const init = path.join(tmp, "ReplicatedStorage", "Parent", "init.luau");
+    fs.unlinkSync(init);
+    daemon.handleFileDelete(init);
+    fs.writeFileSync(init, "return 5");
+    daemon.handleFileAdd(init, "return 5");
+    daemon.handleFileChange(init, "return 5");
+    await wait(650);
+    assert.equal(daemon.tree.getNode("parent").className, "ModuleScript");
+    assert.equal(fs.readFileSync(init, "utf8"), "return 5");
+    assert.equal(
+      sent.filter(
+        (m) => m.type === "moveInstance" || m.type === "deleteInstance",
+      ).length,
+      0,
+    );
+  });
+});
+
+test("live watcher suppresses Studio layout promotion echoes and follows folder-backed moves", async () => {
+  await withFolderBackedDaemon(async (daemon, tmp, sent) => {
+    folderBackedSnapshot(daemon);
+    daemon.fileWatcher.watch(tmp);
+    await new Promise<void>((resolve) =>
+      daemon.fileWatcher.watcher.once("ready", resolve),
+    );
+    // Drop initial pre-watch directory suppressions before exercising real events.
+    await wait(1100);
+    const dir = path.join(tmp, "ReplicatedStorage", "Parent");
+    const renamed = path.join(tmp, "ReplicatedStorage", "Moved");
+    fs.renameSync(dir, renamed);
+    await wait(1400);
+    assert.equal(
+      sent.filter((m) => m.type === "moveInstance" && m.guid === "parent")
+        .length,
+      1,
+    );
+    assert.equal(sent.filter((m) => m.type === "createInstance").length, 0);
+    assert.ok(daemon.tree.getNode("part"));
+    assert.deepEqual(daemon.tree.getNode("parent").path, [
+      "ReplicatedStorage",
+      "Moved",
+    ]);
+    sent.length = 0;
+    fs.writeFileSync(path.join(renamed, "Child.luau"), "return 6");
+    await wait(600);
+    assert.ok(
+      sent.some(
+        (m) =>
+          m.type === "patchScript" &&
+          m.guid === "child" &&
+          m.source === "return 6",
+      ),
+    );
+
+    // An upstream instance notification creates a script descendant through a
+    // Folder under a flat script, promoting that ancestor to init layout.
+    daemon.handleInstanceUpdated({
+      guid: "flat",
+      className: "ModuleScript",
+      name: "Flat",
+      path: ["ReplicatedStorage", "Flat"],
+      parentGuid: "rs",
+      source: "return {}",
+    });
+    await wait(600);
+    sent.length = 0;
+    daemon.handleInstanceUpdated({
+      guid: "nestedFolder",
+      className: "Folder",
+      name: "Nested",
+      path: ["ReplicatedStorage", "Flat", "Nested"],
+      parentGuid: "flat",
+    });
+    daemon.handleInstanceUpdated({
+      guid: "nestedScript",
+      className: "ModuleScript",
+      name: "Child",
+      path: ["ReplicatedStorage", "Flat", "Nested", "Child"],
+      parentGuid: "nestedFolder",
+      source: "return 7",
+    });
+    await wait(900);
+    assert.ok(
+      fs.existsSync(path.join(tmp, "ReplicatedStorage", "Flat", "init.luau")),
+    );
+    assert.equal(
+      fs.existsSync(path.join(tmp, "ReplicatedStorage", "Flat.luau")),
+      false,
+    );
+    assert.equal(
+      sent.filter((m) =>
+        ["createInstance", "deleteInstance", "moveInstance"].includes(m.type),
+      ).length,
+      0,
+      "daemon writes must not echo as structural edits",
+    );
+  });
+});
+
 test("orphan cleanup preserves non-script files and honors per-place overrides with init layouts", async () => {
   await withFolderBackedDaemon(async (daemon, tmp) => {
     folderBackedSnapshot(daemon);
@@ -316,8 +418,14 @@ test("orphan cleanup preserves non-script files and honors per-place overrides w
     for (const file of ["orphan.lua", "orphan.luau", "orphan.server.luau"]) {
       assert.equal(fs.existsSync(path.join(dir, file)), false);
     }
-    assert.equal(fs.readFileSync(path.join(dir, "init.luau"), "utf8"), "return {}");
-    assert.equal(fs.readFileSync(path.join(dir, "Child.luau"), "utf8"), "return 1");
+    assert.equal(
+      fs.readFileSync(path.join(dir, "init.luau"), "utf8"),
+      "return {}",
+    );
+    assert.equal(
+      fs.readFileSync(path.join(dir, "Child.luau"), "utf8"),
+      "return 1",
+    );
     config.deleteOrphansOnConnect = true;
     daemon.applyPlaceConfig({ deleteOrphansOnConnect: false });
     fs.writeFileSync(path.join(dir, "orphan.luau"), "keep this too");

@@ -30,3 +30,11 @@ Previous integration branch: `integration/2026-06-28-18-05`
 ### Same Branch, Different Merged Commit
 
 - None (both custom branch tips are unchanged).
+
+## Final Verification and Activation
+
+- Upstream baseline: build and 81 tests passed. Final integration: build and 91 tests passed (10 additional regressions). The real watcher regression covers folder-backed directory moves, subsequent source edits, and ancestor layout promotion without structural echo messages. Atomic init replacement does not demote or delete an instance.
+- Node 24.22.1 used via `mise exec node@24.22.1 -- npm ci`, `npm run build` and `npm test` (run npm commands under the same mise environment).
+- CLI and plugin source versions are both `2.5.0`; major/minor `2.5` must match. Built an offline `dist/AzulCompanionPlugin-v2.5.0.rbxm` using the upstream `buildRojoProject`/`writeRojoProject` generator with `plugin/plugin.sourcemap.json`, rooted at `plugin/sync/ReplicatedFirst/AzulCompanionPlugin.server.luau`, followed by Rojo 7.7.0 `build`. Deserialized with Lune 0.10.4: one Script root, version 2.5.0 and 119 nonempty descendant scripts, including bundled dependencies.
+- Did not run `npm run plugin:build`: despite its name, upstream's script pushes destructively into Studio. No Studio/game connection, push, auto-pack enablement, global config edits, or consumer project edits were performed. Studio runtime validation remains a user step after updating the installed plugin to 2.5.x (Marketplace or the offline model; avoid duplicate installed plugins).
+- Structural sync remains enabled by default. The existing user config has `folderBackedScriptsWithChildren: false`; enable that flag before syncing an init-layout consumer. This global setting was deliberately not changed here.
